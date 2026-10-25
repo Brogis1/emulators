@@ -69,7 +69,7 @@ class NoisyResults:
 
 def simulate(sequence, noise_model=None, n_trajectories: int = 1, eval_fractions: Sequence[float] = (1.0,),
              dt: int = 10, seed: int = 0, device: str | torch.device = "cpu", prefer_device_noise_model: bool = False,
-             replace_sequence_data=None) -> NoisyResults:
+             replace_sequence_data=None, initial_state: str | None = None) -> NoisyResults:
     """Emulate a pulser sequence like MPSBackend.run: same PulserData sampling, one trajectory per SequenceData.
 
     Args:
@@ -80,6 +80,7 @@ def simulate(sequence, noise_model=None, n_trajectories: int = 1, eval_fractions
         prefer_device_noise_model: use the device's default noise model, as MPSConfig.
         replace_sequence_data: optional function SequenceData -> SequenceData applied to each sample (e.g. a
             Heisenberg 3 x n x n interaction stack, as examples/emu_mps/heisenberg.ipynb).
+        initial_state: basis state as a bitstring, atom 0 first, 0 = ground ("g" / "u"); default all 0.
     """
     import logging
     import warnings
@@ -96,11 +97,11 @@ def simulate(sequence, noise_model=None, n_trajectories: int = 1, eval_fractions
     sequences = data.get_sequences()
     if replace_sequence_data is not None:
         sequences = map(replace_sequence_data, sequences)
-    return run_sequence_data(sequences, eval_fractions, seed=seed, device=device)
+    return run_sequence_data(sequences, eval_fractions, seed=seed, device=device, initial_state=initial_state)
 
 
 def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed: int = 0,
-                      device: str | torch.device = "cpu") -> NoisyResults:
+                      device: str | torch.device = "cpu", initial_state: str | None = None) -> NoisyResults:
     """One quantum trajectory per SequenceData of the iterable `sequences` (see the module docstring)."""
     device = torch.device(device)
     rng = np.random.default_rng(seed)
@@ -116,7 +117,7 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
         model = cache[key]
         if times_ns is None:
             times_ns = model.output_times(eval_fractions)
-        P, leaked = model.trajectory(times_ns, rng, stats)
+        P, leaked = model.trajectory(times_ns, rng, stats, initial_state)
         n = model.n_total
         occ, second = ryd.moments(P, n)
         if mean is None:
@@ -195,7 +196,16 @@ class _Model:
                                      self.device)
         return self._hams[key]
 
-    def trajectory(self, out_times: np.ndarray, rng: np.random.Generator, stats: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    def initial_index(self, initial_state: str | None, active: np.ndarray) -> int:
+        """Index, in the active atoms' basis, of the initial basis state (bitstring over all atoms, default 0...0)."""
+        if initial_state is None:
+            return 0
+        if len(initial_state) != self.n_total or set(initial_state) - {"0", "1"}:
+            raise ValueError(f"initial_state must be a bitstring of {self.n_total} characters 0 / 1")
+        return int("".join(b for b, a in zip(initial_state, active) if a) or "0", 2)
+
+    def trajectory(self, out_times: np.ndarray, rng: np.random.Generator, stats: dict,
+                   initial_state: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """(P (T, 2^n_total), leaked (T, n_total)) of one trajectory."""
         active = self.good.copy()  # atoms still in the simulation (not bad, not leaked)
         leaked = np.zeros(self.n_total, bool)
@@ -203,7 +213,7 @@ class _Model:
         P = torch.zeros(T, 2 ** self.n_total, dtype=torch.float64, device=self.device)
         leak_out = torch.zeros(T, self.n_total, dtype=torch.bool)
         psi = torch.zeros(2 ** int(active.sum()), dtype=torch.complex128, device=self.device)
-        psi[0] = 1.0
+        psi[self.initial_index(initial_state, active)] = 1.0
         r = rng.random()
         t, j = 0.0, 0  # current time (ns), next output index
 
@@ -382,17 +392,59 @@ def _build(omega, delta, phi, mat, ops, g_loc, device) -> SimpleNamespace:
     dn_s = torch.as_tensor((dn - 1j * a_loc[0, 1]) / w, **t)
     hop_s = torch.as_tensor(hop / w, dtype=torch.float64, device=device)
     step = _make_step(diag, up_s, dn_s, hop_s, pairs, n)
-    return SimpleNamespace(step=step, w=w, center=center, rho=rho, n=n)
+    return SimpleNamespace(step=step, w=w, center=center, rho=rho, n=n,
+                           diag=diag, up=up_s, dn=dn_s, hop=hop_s, pairs=pairs)  # tensors: for noisy_cheb_fast
+
+
+if ryd.triton is not None:
+    import triton.language as tl
+
+    @ryd.triton.jit
+    def _step_kernel(cur_ptr, prev_ptr, diag_ptr, up_ptr, dn_ptr, bits_ptr, hop_ptr, out_ptr, dim, n_pairs,
+                     N_BITS: tl.constexpr, RECURSION: tl.constexpr, BLOCK: tl.constexpr):
+        """Complex H~ (interleaved re, im float64): out = 2 H~ cur - prev (RECURSION) or H~ cur, BLOCK basis states.
+        H~ = diag + sum_i (up_i |1><0| + dn_i |0><1|) + pair flips (bits[p], amplitude hop[p, 0] equal / hop[p, 1]
+        different bits); atom i <-> bit N_BITS - 1 - i."""
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        cr = tl.load(cur_ptr + 2 * offs)
+        ci = tl.load(cur_ptr + 2 * offs + 1)
+        dr = tl.load(diag_ptr + 2 * offs)
+        di = tl.load(diag_ptr + 2 * offs + 1)
+        acc_r = dr * cr - di * ci
+        acc_i = dr * ci + di * cr
+        for i in tl.static_range(N_BITS):
+            shift = N_BITS - 1 - i
+            src = offs ^ (1 << shift)
+            target_one = ((offs >> shift) & 1) == 1
+            kr = tl.where(target_one, tl.load(up_ptr + 2 * i), tl.load(dn_ptr + 2 * i))
+            ki = tl.where(target_one, tl.load(up_ptr + 2 * i + 1), tl.load(dn_ptr + 2 * i + 1))
+            sr = tl.load(cur_ptr + 2 * src)
+            si = tl.load(cur_ptr + 2 * src + 1)
+            acc_r += kr * sr - ki * si
+            acc_i += kr * si + ki * sr
+        for p in range(n_pairs):
+            bi = tl.load(bits_ptr + 2 * p)
+            bj = tl.load(bits_ptr + 2 * p + 1)
+            a = tl.where(((offs >> bi) ^ (offs >> bj)) & 1 == 1, tl.load(hop_ptr + 2 * p + 1), tl.load(hop_ptr + 2 * p))
+            src = offs ^ ((1 << bi) | (1 << bj))
+            acc_r += a * tl.load(cur_ptr + 2 * src)
+            acc_i += a * tl.load(cur_ptr + 2 * src + 1)
+        if RECURSION:
+            acc_r = 2.0 * acc_r - tl.load(prev_ptr + 2 * offs)
+            acc_i = 2.0 * acc_i - tl.load(prev_ptr + 2 * offs + 1)
+        tl.store(out_ptr + 2 * offs, acc_r)
+        tl.store(out_ptr + 2 * offs + 1, acc_i)
 
 
 def _make_step(diag, up, dn, hop, pairs, n):
-    """step(cur, prev, out) on (2^n,) complex: out = 2 H~ cur - prev, or H~ cur if prev is None."""
+    """step(cur, prev, out) on (2^n,) complex: out = 2 H~ cur - prev, or H~ cur if prev is None. Triton kernel on GPU
+    for 2^n >= TILE (torch fallback, with a warning, if it fails to compile)."""
     dim = 2 ** n
     device = diag.device
     index = torch.arange(dim, device=device)
     differ = [((index >> (n - 1 - i)) ^ (index >> (n - 1 - j))) & 1 == 1 for i, j in pairs.tolist()]
 
-    def step(cur, prev, out):
+    def torch_step(cur, prev, out):
         y = diag * cur
         for i in range(n):  # target bit 0 gets dn * (source bit 1), target bit 1 gets up * (source bit 0)
             v, f = y.view(2 ** i, 2, -1), cur.view(2 ** i, 2, -1)
@@ -405,6 +457,27 @@ def _make_step(diag, up, dn, hop, pairs, n):
             out.copy_(y)
         else:
             torch.sub(y.mul_(2), prev, out=out)
+
+    if not (diag.is_cuda and dim >= ryd.TILE and ryd.USE_TRITON):
+        return torch_step
+    bits = torch.as_tensor(n - 1 - pairs, dtype=torch.int32, device=device).reshape(-1, 2).contiguous()
+    hop = hop.reshape(-1, 2).contiguous()
+    real = [torch.view_as_real(x.contiguous()) for x in (diag, up, dn)]
+    failed = False
+
+    def step(cur, prev, out):
+        nonlocal failed
+        if not failed:
+            try:
+                _step_kernel[(dim // ryd.TILE,)](torch.view_as_real(cur), torch.view_as_real(cur if prev is None else prev),
+                                                 *real, bits, hop, torch.view_as_real(out), dim, len(pairs), N_BITS=n,
+                                                 RECURSION=prev is not None, BLOCK=ryd.TILE, num_warps=ryd.WARPS)
+                return
+            except Exception as error:  # first launches compile: fall back, do not crash
+                import warnings
+                warnings.warn(f"Triton kernel failed ({error!r}): torch step instead (slow)", stacklevel=2)
+                failed = True
+        torch_step(cur, prev, out)
     return step
 
 
