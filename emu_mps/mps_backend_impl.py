@@ -182,6 +182,21 @@ class MPSBackendImpl:
             interaction_ops = torch.tensor(
                 [[[0.0, 0.0], [0.0, 1.0]]], dtype=torch.complex128
             )
+        elif (
+            pulser_data.hamiltonian_type == HamiltonianType.XY
+            and pulser_data.interaction_matrix(self.target_times[0]).shape[0] == 3
+        ):
+            # Heisenberg mode, only reachable through _run_from_sequence_data:
+            # the stack is [Jxx, Jyy, Jzz] and
+            # H_int = ∑ᵢ﹤ⱼ Jxx[i,j]XᵢXⱼ + Jyy[i,j]YᵢYⱼ + Jzz[i,j]ZᵢZⱼ (Pauli matrices)
+            interaction_ops = torch.tensor(
+                [
+                    [[0.0, 1.0], [1.0, 0.0]],
+                    [[0.0, -1.0j], [1.0j, 0.0]],
+                    [[1.0, 0.0], [0.0, -1.0]],
+                ],
+                dtype=torch.complex128,
+            )
         elif pulser_data.hamiltonian_type == HamiltonianType.XY:
             interaction_ops = 2**0.5 * torch.tensor(
                 [
@@ -246,9 +261,12 @@ class MPSBackendImpl:
                 :, :, self.well_prepared_qubits_filter
             ]
 
-        if self.pulser_data.hamiltonian_type == HamiltonianType.XY:
+        if (
+            self.pulser_data.hamiltonian_type == HamiltonianType.XY
+            and matrix.shape[0] == 2
+        ):
             # duplicate the XY interaction, because the XX and YY term
-            # are treated separately in make_H
+            # are treated separately in make_H (a 3-stack is Heisenberg, kept as is)
             matrix = torch.stack((matrix[0], matrix[0], matrix[1]))
         return matrix
 
