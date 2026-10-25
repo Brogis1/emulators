@@ -1,16 +1,23 @@
-"""noisy_vs_emu_mps: noisy_cheb against noisy emu-mps, channel by channel and with FRESNEL's noise model (small registers).
+"""noisy_vs_emu_mps: our noisy engines against noisy emu-mps, channel by channel, pulse features, FRESNEL's model.
 
-Both codes run the very same PulserData samples (one SequenceData per trajectory, as MPSBackend.run):
-- shot-to-shot channels (amplitude, detuning incl. high frequency, Doppler, register, SPAM state preparation) give
-  deterministic trajectories: compared trajectory by trajectory (max |<n_i> difference|, to be compared with the
-  noiseless floor, i.e. emu-mps' own TDVP / truncation error);
-- Lindblad channels (dephasing, depolarizing, relaxation, eff_noise, leakage) are random: the trajectory means of
-  <n_i>(t) are compared with z = |mean_mps - mean_cheb| / sqrt(var_mps / N_mps + var_cheb / N_cheb);
-- readout errors (SPAM p_false_pos / p_false_neg): emu-mps' sampled bitstrings against noisy_cheb.readout(P), chi^2.
-"noise effect" = max |<n_i>_noisy - <n_i>_noiseless|: the test means something only if it is many std. errors.
+Every case is a small pulser sequence (3 atoms) run by emu-mps and by one of our engines (--engine reference |
+fast | turbo) on the very same PulserData samples (one SequenceData per trajectory, as MPSBackend.run):
+- deterministic cases (noiseless, pulse features, and shot-to-shot channels: amplitude, detuning incl. high
+  frequency, Doppler, register, SPAM state preparation) are compared trajectory by trajectory: max |<n_i> difference|;
+  the floor is emu-mps' own TDVP / truncation error (1e-15 for quenches, up to 1e-6 for XY couplings in 1/r^3);
+- Lindblad channels (dephasing, depolarizing, relaxation, eff_noise, leakage) are random: trajectory means of <n_i>(t)
+  are compared with z = |mean_mps - mean_ours| / (s sqrt(1 / N_mps + 1 / N_ours)), s the per-trajectory spread from a
+  separate N_SPREAD-trajectory turbo sample (a sample's own spread misses rare early jumps and inflated z);
+- readout errors (SPAM p_false_pos / p_false_neg): emu-mps' sampled bitstrings against readout(P): chi^2 when the
+  trajectories are deterministic, else per-bitstring z from the trajectory-to-trajectory spread of the frequencies
+  (shots of one trajectory share its P, so they are not independent).
+"noise effect" = max |<n_i>_noisy - <n_i>_noiseless|, also in standard errors: a test only means something if that
+number is large. emu-mps results of cases without shot-to-shot noise are cached (EMU_MPS_CACHE), so other engines
+can be compared without rerunning emu-mps.
 
-Usage: python3 noisy_vs_emu_mps.py [CHANNEL ...] [--traj N] [--cheb-factor K]   (default: every channel)
-FRESNEL's spec is read from FRESNEL_SPECS (abstract representation fetched from Pasqal Cloud).
+Usage: python3 noisy_vs_emu_mps.py [CASE ...] [--traj N] [--cheb-factor K] [--engine E] [--single]
+(default: every case; our engine runs K x N trajectories for random channels). FRESNEL's spec is read from
+FRESNEL_SPECS (abstract representation fetched from Pasqal Cloud, default ~/.cache/pasqal/fresnel_specs.json).
 """
 from __future__ import annotations
 

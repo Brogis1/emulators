@@ -24,6 +24,8 @@ shot noise (amplitude, detuning, positions) needs no trajectories: one row of `e
 The Rydberg Hamiltonian of rydberg_cheb_fast is a Heisenberg one: with n = (1 - Z) / 2,
 sum_{i<j} J_ij n_i n_j = sum_{i<j} J_ij / 4 Z_i Z_j + sum_i (sum_j J_ij / 2) n_i - sum_{i<j} J_ij / 4 (rydberg_as_heisenberg),
 equal up to a constant, i.e. a global phase: probabilities are identical.
+For general noise (relaxation, eff_noise, leakage, SPAM, shot-to-shot), pulses and local control, use
+noisy_cheb_turbo (see README.md); evolve_noisy here is the earlier Pauli-only version and stays as it is.
 Self-check: python3 heisenberg_cheb_fast.py (dense matrix exponentials and Lindblad superoperators, CPU).
 """
 from __future__ import annotations

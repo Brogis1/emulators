@@ -32,6 +32,16 @@ Method (Monte Carlo wave function, as emu-mps, without time step or truncation e
    the trajectory continues with that atom removed and reported as leaked. Operators must either stay in {g, r} or
    map {g, r} into x, and none may leave x (NotImplementedError otherwise).
 
+Usage (same arguments as emu-mps where they exist; see scripts/README.md for the faster engines):
+    import noisy_cheb
+    res = noisy_cheb.simulate(seq, pulser.NoiseModel(relaxation_rate=0.1, dephasing_rate=0.2), n_trajectories=500,
+                              eval_fractions=np.linspace(0, 1, 21), initial_state="0101", device="cuda")
+    res.occupations.mean(0)            # <n_i>(t), trajectory average, (T, n); error bars: .std(0) / sqrt(500)
+    res.correlations                   # <n_i n_j>(t) (T, n, n); connected: minus the outer product of <n_i>
+    noisy_cheb.readout(res.probabilities[-1], p_false_pos, p_false_neg)  # measured bitstring distribution
+
+This is the reference engine: one trajectory at a time, written for clarity. noisy_cheb_fast (batched) and
+noisy_cheb_turbo (batched, per-row Hamiltonians, single-launch kernels) produce the same trajectories, faster.
 Requires emu-base / emu-mps (PulserData, MPSConfig) for `simulate`; the engine itself only needs torch and numpy.
 Self-check: python3 noisy_cheb.py (single trajectories against dense quantum jumps with the same random numbers,
 trajectory averages against the dense Lindblad equation; 2-3 atoms, CPU).
@@ -52,6 +62,20 @@ CROUZEIX = 1 + 2 ** 0.5  # ||f(A)|| <= CROUZEIX max_{W(A)} |f|
 PROBES_MIN, PROBES_MAX = 16, 64  # probes per segment: PROBES_MIN + w (t1 - t0), segments capped accordingly
 GROWTH_SLACK = 1e-6  # relative slack of the check ||T_k psi|| <= CROUZEIX rho^k ||psi||
 BLOCK = 32  # ring length of the series (vectors)
+CACHE_BYTES = 2 ** 30  # Hamiltonian caches hold at most this many bytes of 2^n vectors (and always >= 2 entries)
+GPU_FRACTION = 0.4  # share of the free GPU memory the series may use (headroom for allocator fragmentation)
+
+
+def _cache_entries(entry_bytes: float) -> int:
+    """How many cache entries of entry_bytes fit in CACHE_BYTES (2 to 64): small registers keep every piece of a
+    time-dependent drive, large ones only the current and the next (an entry holds full 2^n vectors)."""
+    return max(2, min(64, int(CACHE_BYTES // max(entry_bytes, 1))))
+
+
+def _occupation(index: torch.Tensor, n: int, i: int) -> torch.Tensor:
+    """float64 occupation of atom i in every basis state (atom 0 = most significant bit), computed on the fly from
+    index = arange(2^n): storing all n of them would cost n float64 vectors (3 GB at n = 24)."""
+    return ((index >> (n - 1 - i)) & 1).to(torch.float64)
 
 
 @dataclass
@@ -188,7 +212,7 @@ class _Model:
     def ham(self, p: int, active: tuple[bool, ...]) -> SimpleNamespace:
         key = (p, active)
         if key not in self._hams:
-            if len(self._hams) > 64:
+            if len(self._hams) >= _cache_entries(48 * 2 ** int(sum(active))):
                 self._hams.clear()
             idx = np.nonzero(active)[0]
             _, _, omega, delta, phi, mat = self.pieces[p]
@@ -216,6 +240,7 @@ class _Model:
         psi[self.initial_index(initial_state, active)] = 1.0
         r = rng.random()
         t, j = 0.0, 0  # current time (ns), next output index
+        probes_max = self._probes_max(int(active.sum()))
 
         def record():
             nonlocal j
@@ -226,36 +251,58 @@ class _Model:
                 j += 1
 
         record()
+        # psi is NOT renormalised between jumps: its norm decays under H_eff and the trajectory jumps when
+        # ||psi||^2 reaches the threshold r. Time advances piece by piece (constant H), each piece segment by segment.
         for p, (ta, tb, *_) in enumerate(self.pieces):
             while t < tb - 1e-9:
-                h = self.ham(p, tuple(active))
+                h = self.ham(p, tuple(active))  # rebuilt only when the piece or the set of active atoms changes
+                # segment end: piece end, next output time, or the length that PROBES_MAX probes resolve
                 next_out = out_times[j] if j < T else np.inf
-                t1 = min(tb, next_out if next_out > t + 1e-9 else np.inf, t + 1000 * (PROBES_MAX - PROBES_MIN) / h.w)
+                t1 = min(tb, next_out if next_out > t + 1e-9 else np.inf, t + 1000 * (probes_max - PROBES_MIN) / h.w)
                 delta_us = (t1 - t) / 1000
-                m = int(PROBES_MIN + math.ceil(h.w * delta_us))
+                m = int(PROBES_MIN + math.ceil(h.w * delta_us))  # enough probes to interpolate the norm (~ w delta)
                 nodes = delta_us * (1 - np.cos(np.pi * np.arange(m + 1) / m)) / 2  # Chebyshev-Lobatto, increasing
-                states = _propagate(h, psi, nodes, stats)  # (m + 1, dim)
+                states = _propagate(h, psi, nodes, stats)  # (m + 1, dim): one series gives psi at every probe
                 norms = states.abs().square().sum(1).cpu().numpy()
                 stats["segments"] += 1
-                if norms[-1] > r:
+                if norms[-1] > r:  # norm non-increasing: still above r at the end => no jump in this segment
                     psi, t = states[-1].clone(), t1
                     del states
                     record()
                     continue
+                # jump inside: bracket it between two probes, root of the interpolated norm, then the exact state
+                # there by one short series from the probe before the root
                 k = int(np.nonzero(norms <= r)[0][0])  # first probe below the threshold (k >= 1: norms[0] > r)
                 tau = _interpolated_root(nodes, norms, r, k - 1)
                 psi = _propagate(h, states[k - 1].clone(), np.array([tau - nodes[k - 1]]), stats)[0]
                 del states
                 stats["jump_norm_dev"] = max(stats["jump_norm_dev"], abs(float(psi.abs().square().sum()) - r))
                 t += 1000 * tau
-                psi = self._jump(psi, active, leaked, rng, stats)
-                r = rng.random()
+                psi = self._jump(psi, active, leaked, rng, stats)  # normalised; may remove a leaked atom
+                probes_max = self._probes_max(int(active.sum()))
+                r = rng.random()  # next threshold (random-number order: threshold, then per jump choice + threshold)
                 record()
         return P, leak_out
+
+    def _probes_max(self, n_active: int) -> int:
+        """Probes per segment that fit beside the ring on the GPU (PROBES_MAX if they all fit); MemoryError if not even
+        a minimal segment fits (n ~ 25+ on a 40 GB GPU: use noisy_cheb_fast / noisy_cheb_turbo, which plan memory)."""
+        if self.device.type != "cuda":
+            return PROBES_MAX
+        torch.cuda.empty_cache()  # cached free blocks are not counted by mem_get_info
+        vectors = GPU_FRACTION * torch.cuda.mem_get_info(self.device)[0] / (16 * 2 ** n_active)
+        m = min(PROBES_MAX, int(vectors) - BLOCK - 8)  # probe block + ring + a few temporaries (states, psi, ...)
+        if m < PROBES_MIN + 4:
+            raise MemoryError(f"{n_active} atoms: the reference engine's probe block does not fit on the GPU; use "
+                              "noisy_cheb_fast / noisy_cheb_turbo or fewer atoms")
+        return m
 
     def _jump(self, psi, active, leaked, rng, stats):
         """Draw (qubit, operator) with weight ||L psi||^2, apply it, normalise; leakage removes the atom."""
         n = int(active.sum())
+        # ||L_k(i) psi||^2 = Tr(L_k^dag L_k rho_i) with rho_i the reduced 2 x 2 density matrix of qubit i (unnormalised
+        # psi: only ratios matter). Candidates ordered (qubit, operator) row-major; the faster engines keep this order
+        # and the arithmetic below so that the same random number picks the same jump.
         rho = [_reduced(psi, i, n) for i in range(n)]  # 2 x 2 per active qubit
         ops = [(i, k) for i in range(n) for k in range(len(self.jump_ldl))]
         weights = np.array([max(float(np.real(np.trace(self.jump_ldl[k] @ rho[i]))), 0.0) for i, k in ops])
@@ -350,7 +397,10 @@ def _build(omega, delta, phi, mat, ops, g_loc, device) -> SimpleNamespace:
     """H~ = (H_eff - c) / w for one piece: step, w, complex center c, rho (see the module docstring)."""
     n = len(omega)
     dim = 2 ** n
-    bits = [b.to(torch.float64) for b in ryd._occupations(n, device)]
+    index = torch.arange(dim, device=device)
+    bit = lambda i: _occupation(index, n, i)  # noqa: E731  occupation of atom i in every |x>, on the fly
+    # 1. Hermitian part H: a real diagonal (diagonal interaction operators, detunings), single-qubit flips (the
+    #    drive) and pair flips (X X / Y Y couplings), stored as amplitudes for the step kernel.
     diag_re = torch.zeros(dim, dtype=torch.float64, device=device)
     same = np.zeros((n, n))
     differ = np.zeros((n, n))
@@ -359,7 +409,7 @@ def _build(omega, delta, phi, mat, ops, g_loc, device) -> SimpleNamespace:
         if np.allclose(O, np.diag(np.diag(O))):
             d0, d1 = np.diag(O).real
             for i, j in zip(*np.nonzero(M)):
-                diag_re += M[i, j] * (d0 + (d1 - d0) * bits[i]) * (d0 + (d1 - d0) * bits[j])
+                diag_re += M[i, j] * (d0 + (d1 - d0) * bit(i)) * (d0 + (d1 - d0) * bit(j))
         else:
             if not (abs(O[0, 0]) == abs(O[1, 1]) == 0 and np.isclose(O[1, 0] ** 2, O[0, 1] ** 2)
                     and abs((O[1, 0] ** 2).imag) < 1e-12):
@@ -367,12 +417,15 @@ def _build(omega, delta, phi, mat, ops, g_loc, device) -> SimpleNamespace:
             same += M * (O[1, 0] ** 2).real  # 00 <-> 11
             differ += M * abs(O[1, 0]) ** 2  # 01 <-> 10
     for i in range(n):
-        diag_re -= delta[i] * bits[i]
+        diag_re -= delta[i] * bit(i)
     pairs = np.argwhere(np.abs(same) + np.abs(differ) > 0)
     hop = np.array([[same[i, j], differ[i, j]] for i, j in pairs]).reshape(-1, 2)
     up = omega / 2 * np.exp(1j * phi)  # <1| H |0>
     dn = omega / 2 * np.exp(-1j * phi)  # <0| H |1>
 
+    # 2. Spectral interval of H (Gershgorin: every row has the same off-diagonal content, one entry per flip) and of
+    #    the anti-Hermitian part -i G (G = sum_i g_loc(i): its spectrum is sum_i [lam0, lam1]). The centre of G is a
+    #    pure decay e^{-n g_mid t}, applied exactly at the end; what is left spans i[-beta_w, beta_w].
     radius = float(np.abs(omega).sum() / 2 + (np.abs(hop).max(1).sum() if len(hop) else 0.0))
     e_min, e_max = float(diag_re.min()) - radius, float(diag_re.max()) + radius
     lam = np.linalg.eigvalsh(g_loc)
@@ -384,9 +437,11 @@ def _build(omega, delta, phi, mat, ops, g_loc, device) -> SimpleNamespace:
     s = 0.5 * (beta ** 2 + math.sqrt(beta ** 4 + 4 * beta ** 2))
     rho = math.sqrt(1 + s) + math.sqrt(s)  # ellipse of foci +/-1 around [-1, 1] x i[-beta, beta]
 
+    # 3. H~ = (H_eff - center) / w as the step kernel stores it: complex diagonal, flip amplitudes up (|1><0|) and
+    #    dn (|0><1|) per qubit, real pair amplitudes (equal bits, different bits).
     diag = ((diag_re - center.real) / w).to(torch.complex128)
     for i in range(n):  # -i (centred G) on the diagonal
-        diag += -1j * (a_loc[0, 0] + (a_loc[1, 1] - a_loc[0, 0]) * bits[i]) / w
+        diag += -1j * (a_loc[0, 0] + (a_loc[1, 1] - a_loc[0, 0]) * bit(i)) / w
     t = dict(dtype=torch.complex128, device=device)
     up_s = torch.as_tensor((up - 1j * a_loc[1, 0]) / w, **t)
     dn_s = torch.as_tensor((dn - 1j * a_loc[0, 1]) / w, **t)
@@ -436,13 +491,27 @@ if ryd.triton is not None:
         tl.store(out_ptr + 2 * offs + 1, acc_i)
 
 
+class _parity_masks:
+    """Lazy bit-parity masks of the pairs (one boolean 2^n vector per pair, for the torch fallback step only): the
+    Triton kernel computes the parity itself, so a GPU run never builds them (they cost P x 2^n bytes)."""
+
+    def __init__(self, pairs, n, device):
+        self.pairs, self.n, self.device, self.masks = pairs, n, device, None
+
+    def get(self):
+        if self.masks is None:
+            index = torch.arange(2 ** self.n, device=self.device)
+            self.masks = [((index >> (self.n - 1 - i)) ^ (index >> (self.n - 1 - j))) & 1 == 1
+                          for i, j in self.pairs.tolist()]
+        return self.masks
+
+
 def _make_step(diag, up, dn, hop, pairs, n):
     """step(cur, prev, out) on (2^n,) complex: out = 2 H~ cur - prev, or H~ cur if prev is None. Triton kernel on GPU
     for 2^n >= TILE (torch fallback, with a warning, if it fails to compile)."""
     dim = 2 ** n
     device = diag.device
-    index = torch.arange(dim, device=device)
-    differ = [((index >> (n - 1 - i)) ^ (index >> (n - 1 - j))) & 1 == 1 for i, j in pairs.tolist()]
+    differ = _parity_masks(pairs, n, device)
 
     def torch_step(cur, prev, out):
         y = diag * cur
@@ -452,7 +521,7 @@ def _make_step(diag, up, dn, hop, pairs, n):
             v[:, 1].add_(f[:, 0], alpha=up[i].item())
         for p, (i, j) in enumerate(pairs.tolist()):
             flipped = cur.view(2 ** i, 2, 2 ** (j - i - 1), 2, -1).flip((1, 3)).reshape(dim)
-            y.addcmul_(torch.where(differ[p], hop[p, 1], hop[p, 0]), flipped)
+            y.addcmul_(torch.where(differ.get()[p], hop[p, 1], hop[p, 0]), flipped)
         if prev is None:
             out.copy_(y)
         else:
@@ -483,11 +552,15 @@ def _make_step(diag, up, dn, hop, pairs, n):
 
 def _propagate(h: SimpleNamespace, psi: torch.Tensor, offsets_us: np.ndarray, stats: dict) -> torch.Tensor:
     """States (m, 2^n) e^{-i H_eff s} psi at the offsets s (us) of one piece."""
+    # psi(s) = e^{-i c s} sum_k c_k(w s) T_k(H~) psi: only the coefficients depend on s, so every offset is one
+    # column of `acc`. The T_k come from T_{k+1} = 2 H~ T_k - T_{k-1} through a ring of BLOCK vectors; each full
+    # ring is added to acc by one matrix product (rydberg_cheb_fast's scheme), its last vector checked against the
+    # ellipse bound (a failure means wrong spectral bounds, never silently wrong results).
     alphas = h.w * np.asarray(offsets_us, float)
     coef = torch.as_tensor(ryd._coefficients(alphas, h.rho), device=psi.device)
     coef = torch.view_as_complex(coef.view(len(coef), len(alphas), 2).contiguous())  # (K, m)
     n_terms, dim = coef.shape[0], psi.numel()
-    acc = torch.zeros(dim, len(alphas), dtype=torch.complex128, device=psi.device)
+    acc = torch.zeros(len(alphas), dim, dtype=torch.complex128, device=psi.device)  # (m, dim), filled in place
     block = min(BLOCK, n_terms)
     ring = torch.empty(block, dim, dtype=torch.complex128, device=psi.device)
     ring[0] = psi
@@ -497,7 +570,7 @@ def _propagate(h: SimpleNamespace, psi: torch.Tensor, offsets_us: np.ndarray, st
     k0, done, i = 0, 0, 2
 
     def flush(upto):
-        acc.addmm_(ring[done:upto].T, coef[k0 + done:k0 + upto])
+        acc.addmm_(coef[k0 + done:k0 + upto].T, ring[done:upto])  # (m, b) @ (b, dim), no temporary
         k = k0 + upto - 1  # check ||T_k psi|| <= CROUZEIX rho^k ||psi||
         growth = float(ring[upto - 1].norm()) / (CROUZEIX * h.rho ** k * norm0)
         stats["max_growth"] = max(stats["max_growth"], growth)
@@ -505,7 +578,7 @@ def _propagate(h: SimpleNamespace, psi: torch.Tensor, offsets_us: np.ndarray, st
             raise FloatingPointError(f"Chebyshev vectors exceed the ellipse bound ({growth:.3e}): spectral bounds wrong")
 
     while k0 + i < n_terms:
-        if i == block:
+        if i == block:  # ring full: accumulate it, keep its last two vectors to continue the recurrence
             flush(block)
             ring[0].copy_(ring[block - 2])
             ring[1].copy_(ring[block - 1])
@@ -515,9 +588,10 @@ def _propagate(h: SimpleNamespace, psi: torch.Tensor, offsets_us: np.ndarray, st
         i += 1
     flush(min(i, n_terms - k0))
     stats["matvecs"] += n_terms - 1
+    # back from H~ to H_eff: phase of the real centre (long double: c s reaches ~1e3 rad) and the exact decay
     phase = np.exp(-1j * np.longdouble(h.center.real) * np.asarray(offsets_us, np.longdouble)).astype(complex)
     decay = np.exp(h.center.imag * np.asarray(offsets_us, float))  # center.imag = -n g_mid <= 0
-    return acc.T * torch.as_tensor(phase * decay, device=psi.device)[:, None]
+    return acc.mul_(torch.as_tensor(phase * decay, device=psi.device)[:, None])
 
 
 # ---------------------------------------------------------------- self-check

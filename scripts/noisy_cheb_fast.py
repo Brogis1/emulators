@@ -14,6 +14,14 @@ Optimizations:
 Random numbers: one numpy stream per trajectory (SeedSequence(seed).spawn), consumed as noisy_cheb's
 _Model.trajectory (threshold; per jump: operator choice, new threshold). In complex128 a trajectory is therefore the
 same as noisy_cheb's with that stream, whatever the batch: the self-check verifies it, plus the Lindblad limit.
+5. Interaction part reused across drive steps: a time-dependent drive (pulse shapes, local pulses, DMM) changes only
+   the detunings, Rabi frequencies and phases between pieces; the interaction diagonal and pair amplitudes are built
+   once per coupling matrix, and all pieces share one spectral interval (the union of theirs), so that segments of
+   equal length share their Bessel tables too.
+
+Usage: as noisy_cheb (same arguments and results), plus single / max_batch / memory_bytes:
+    res = noisy_cheb_fast.simulate(seq, noise_model, n_trajectories=5000, eval_fractions=fractions, device="cuda")
+Batching only helps when samples are identical (Lindblad-only noise); for shot-to-shot noise use noisy_cheb_turbo.
 Self-check: python3 noisy_cheb_fast.py (CPU, 3 atoms).
 """
 from __future__ import annotations
@@ -62,7 +70,7 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
     Args:
         single: complex64 instead of complex128.
         max_batch: cap on the rows of a batch (default: memory budget only).
-        memory_bytes: memory the batch may use (default: half the free GPU memory; 2 GB on CPU).
+        memory_bytes: memory the batch may use (default: 40 % of the free GPU memory; 2 GB on CPU).
         initial_state: as noisy_cheb.simulate.
     """
     device = torch.device(device)
@@ -72,7 +80,13 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
     stats = dict(trajectories=0, jumps=0, leaks=0, segments=0, matvecs=0, row_matvecs=0, jump_norm_dev=0.0,
                  max_growth=0.0, batches=0)
     if memory_bytes is None:
-        memory_bytes = 0.5 * torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else 2e9
+        if device.type == "cuda":
+            # return the caching allocator's free blocks first (as rydberg_cheb_fast): mem_get_info does not count
+            # them, and a run following another one would otherwise get smaller batches (found: turbo 2x slower)
+            torch.cuda.empty_cache()
+            memory_bytes = 0.4 * torch.cuda.mem_get_info(device)[0]  # headroom for allocator fragmentation
+        else:
+            memory_bytes = 2e9
     out = None
     i = 0
     while i < len(sds):
@@ -114,7 +128,7 @@ class _Batch:
         flips) is built once per coupling matrix; a piece only adds -sum delta_i n_i, Omega and phi."""
         key = (p, active)
         if key not in self._hams:
-            if len(self._hams) > 64:
+            if len(self._hams) >= ref._cache_entries(48 * 2 ** int(sum(active))):
                 self._hams.clear()
             self._hams[key] = self._build(p, active, self._common_bounds(active))
         return self._hams[key]
@@ -126,8 +140,11 @@ class _Batch:
         key = (mat.tobytes(), active)
         cache = self.__dict__.setdefault("_inter", {})
         if key not in cache:
+            if len(cache) >= ref._cache_entries(16 * 2 ** len(idx)):
+                cache.clear()
             n = len(idx)
-            bits = [b.to(torch.float64) for b in ryd._occupations(n, self.device)]
+            index = torch.arange(2 ** n, device=self.device)
+            bit = lambda i: ref._occupation(index, n, i)  # noqa: E731  (on the fly: n float64 vectors not stored)
             diag = torch.zeros(2 ** n, dtype=torch.float64, device=self.device)
             same, differ = np.zeros((n, n)), np.zeros((n, n))
             for M, O in zip(mat, self.model.ops):  # as noisy_cheb._build
@@ -135,23 +152,23 @@ class _Batch:
                 if np.allclose(O, np.diag(np.diag(O))):
                     d0, d1 = np.diag(O).real
                     for i, j in zip(*np.nonzero(M)):
-                        diag += M[i, j] * (d0 + (d1 - d0) * bits[i]) * (d0 + (d1 - d0) * bits[j])
+                        diag += M[i, j] * (d0 + (d1 - d0) * bit(i)) * (d0 + (d1 - d0) * bit(j))
                 else:
                     same += M * (O[1, 0] ** 2).real
                     differ += M * abs(O[1, 0]) ** 2
             pairs = np.argwhere(np.abs(same) + np.abs(differ) > 0)
             hop = np.array([[same[i, j], differ[i, j]] for i, j in pairs]).reshape(-1, 2)
-            cache[key] = (bits, diag, pairs, hop)
+            cache[key] = (index, diag, pairs, hop)
         return cache[key]
 
     def _diagonal(self, p, active):
         """Real diagonal of H (interactions - sum_i delta_i n_i) and the Gershgorin radius of piece p."""
         idx = np.nonzero(active)[0]
         _, _, omega, delta, phi, _ = self.model.pieces[p]
-        bits, diag, pairs, hop = self._interaction(p, active)
+        index, diag, pairs, hop = self._interaction(p, active)
         diag = diag.clone()
         for i, a in enumerate(idx):
-            diag -= delta[a] * bits[i]
+            diag -= delta[a] * ref._occupation(index, len(idx), i)
         radius = float(np.abs(omega[idx]).sum() / 2 + (np.abs(hop).max(1).sum() if len(hop) else 0.0))
         return diag, radius
 
@@ -179,13 +196,13 @@ class _Batch:
         idx = np.nonzero(active)[0]
         n = len(idx)
         _, _, omega, delta, phi, _ = self.model.pieces[p]
-        bits, _, pairs, hop = self._interaction(p, active)
+        index, _, pairs, hop = self._interaction(p, active)
         diag_re, _ = self._diagonal(p, active)
         lam = np.linalg.eigvalsh(self.model.g_loc)
         a_loc = self.model.g_loc - 0.5 * (lam[0] + lam[1]) * np.eye(2)
         diag = ((diag_re - center.real) / w).to(torch.complex128)
         for i in range(n):
-            diag += -1j * (a_loc[0, 0] + (a_loc[1, 1] - a_loc[0, 0]) * bits[i]) / w
+            diag += -1j * (a_loc[0, 0] + (a_loc[1, 1] - a_loc[0, 0]) * ref._occupation(index, n, i)) / w
         up = (omega[idx] / 2 * np.exp(1j * phi[idx]) - 1j * a_loc[1, 0]) / w
         dn = (omega[idx] / 2 * np.exp(-1j * phi[idx]) - 1j * a_loc[0, 1]) / w
         c = dict(dtype=self.dtype, device=self.device)
@@ -195,6 +212,7 @@ class _Batch:
         return SimpleNamespace(w=w, center=center, rho=rho, n=n), step
 
     def run(self) -> dict:
+        """Advance all rows from 0 to the end; returns sums over rows of P and <n_i n_j>, per-row <n_i> and leaks."""
         model, R, T = self.model, len(self.rngs), len(self.out_times)
         n_total = self.n_total
         self.thresholds = np.array([g.random() for g in self.rngs])
@@ -202,11 +220,14 @@ class _Batch:
         self.leaked = np.zeros((R, n_total), bool)
         psi = torch.zeros(R, 2 ** int(model.good.sum()), dtype=self.dtype, device=self.device)
         psi[:, model.initial_index(self.initial_state, model.good)] = 1.0
+        # rows are grouped by their set of active atoms (leakage shrinks it): all rows of a group share H~ and a
+        # state dimension, so they evolve as one block
         groups = {tuple(model.good): (list(range(R)), psi)}  # active mask -> (rows, states), all at time t
         self.res = dict(P=torch.zeros(T, 2 ** n_total, dtype=torch.float64, device=self.device),
                         corr=torch.zeros(T, n_total, n_total, dtype=torch.float64, device=self.device),
                         occ=torch.zeros(R, T, n_total, dtype=torch.float64),
                         leaked=torch.zeros(R, T, n_total, dtype=torch.bool))
+        # segment ends common to every row: output times and piece boundaries
         ends = sorted({float(x) for x in self.out_times} | {float(p[1]) for p in model.pieces})
         t, j = 0.0, 0
         j = self._record(groups, t, j)
@@ -234,7 +255,12 @@ class _Batch:
         return j
 
     def _segment(self, groups, p, t, t1):
-        """All rows from t to t1 within piece p; rows that jump continue from their jump time."""
+        """All rows from t to t1 within piece p; rows that jump continue from their jump time.
+
+        `pending` holds rows still short of t1 with their own current time (all equal to t at first; a row that jumped
+        at t + tau restarts from there). Each pass propagates a group to t1 in one batched series: rows still above
+        their threshold at t1 are done (the norm is non-increasing, so they did not jump on the way); the others get
+        their jump located, applied, and go back to `pending` (possibly in another group after a leak)."""
         done: dict = {}
         pending = {a: (rows, psi, np.full(len(rows), t)) for a, (rows, psi) in groups.items()}
         while pending:
@@ -284,6 +310,8 @@ class _Batch:
         todo = np.arange(J)
         window = np.asarray(window_us, float).copy()
         while len(todo):
+            # probes over each row's window (one batched series); a window too long for PROBES_MAX probes is only
+            # bracketed (the norm is monotone, so the bracket is exact) and refined on the next pass
             m = int(min(ref.PROBES_MAX, ref.PROBES_MIN + math.ceil(h.w * window[todo].max())))
             nodes = window[todo, None] * (1 - np.cos(np.pi * np.arange(m + 1) / m)) / 2
             states = self._propagate(h, step, start, nodes)  # (len(todo), m + 1, dim)
@@ -295,7 +323,9 @@ class _Batch:
                 k = max(k, 1)
                 if h.w * window[row] <= ref.PROBES_MAX - ref.PROBES_MIN:
                     tau[row] = offset[row] + ref._interpolated_root(nodes[a], norms[a], thresholds[row], k - 1)
-                    bracket_start[row] = states[a, k - 1]
+                    # a copy, not a view: a view would keep the whole (rows, probes, 2^n) block alive into the
+                    # next refinement pass (two blocks at once: out of memory at n = 20)
+                    bracket_start[row] = states[a, k - 1].clone()
                     left[row] = offset[row] + nodes[a, k - 1]
                 else:  # long window: continue from the probe before the crossing, on the bracket
                     refine.append(row)
@@ -312,6 +342,8 @@ class _Batch:
 
     def _propagate(self, h, step, psi, offsets_us):
         """States (R, m, dim) at per-row offsets (R, m) (us) from psi (R, dim) under one piece."""
+        # noisy_cheb._propagate for R rows: the ring holds (BLOCK, R, dim); with offsets shared by all rows (the
+        # common case: every row goes to the same segment end) one coefficient table, cached, else one per row
         R, dim = psi.shape
         alphas = h.w * np.asarray(offsets_us, float)
         shared = bool(np.all(alphas == alphas[:1]))
@@ -321,7 +353,9 @@ class _Batch:
             c = ryd._coefficients(alphas.ravel(), h.rho)
             coef = torch.as_tensor(c[:, 0::2] + 1j * c[:, 1::2], device=psi.device).to(self.dtype).view(-1, *alphas.shape)
         n_terms, m = coef.shape[0], alphas.shape[1]
-        acc = torch.zeros(R, m, dim, dtype=self.dtype, device=psi.device)
+        # accumulated in place: (m, R, dim) with shared coefficients (one addmm_ per ring), (R, m, dim) otherwise
+        # (one baddbmm_); an einsum would allocate a temporary as large as acc at every flush (2x the planned peak)
+        acc = torch.zeros((m, R, dim) if shared else (R, m, dim), dtype=self.dtype, device=psi.device)
         block = min(BLOCK, n_terms)
         ring = torch.empty(block, R, dim, dtype=self.dtype, device=psi.device)
         ring[0] = psi
@@ -329,10 +363,12 @@ class _Batch:
         if n_terms > 1:
             step(ring[0], None, ring[1])
         k0, done, i = 0, 0, 2
-        equation = "bm,brd->rmd" if shared else "brm,brd->rmd"
-
         def flush(upto):
-            acc.add_(torch.einsum(equation, coef[k0 + done:k0 + upto], ring[done:upto]))
+            c, block_ = coef[k0 + done:k0 + upto], ring[done:upto]
+            if shared:
+                acc.view(m, R * dim).addmm_(c.T, block_.reshape(upto - done, R * dim))
+            else:
+                acc.baddbmm_(c.permute(1, 2, 0), block_.permute(1, 0, 2))
             k = k0 + upto - 1
             growth = float((ring[upto - 1].norm(dim=1) / (ref.CROUZEIX * h.rho ** k * norm0)).max())
             self.stats["max_growth"] = max(self.stats["max_growth"], growth)
@@ -355,7 +391,8 @@ class _Batch:
         s = np.asarray(offsets_us, float)
         phase = np.exp(-1j * np.longdouble(h.center.real) * s.astype(np.longdouble)).astype(complex)
         factor = torch.as_tensor(phase * np.exp(h.center.imag * s), device=psi.device).to(self.dtype)
-        return acc.mul_(factor[:, :, None])
+        states = acc.permute(1, 0, 2) if shared else acc  # (R, m, dim) view, no copy
+        return states.mul_(factor[:, :, None])
 
 
 @lru_cache(maxsize=256)
@@ -412,8 +449,7 @@ def _make_batched_step(diag, up, dn, hop, pairs, n):
     """step(cur, prev, out) on (R, 2^n) complex rows sharing H~ (noisy_cheb._make_step, batched)."""
     dim = 2 ** n
     device = diag.device
-    index = torch.arange(dim, device=device)
-    differ = [((index >> (n - 1 - i)) ^ (index >> (n - 1 - j))) & 1 == 1 for i, j in pairs.tolist()]
+    differ = ref._parity_masks(pairs, n, device)  # built on the first torch step only
     up_c, dn_c = up.tolist(), dn.tolist()
 
     def torch_step(cur, prev, out):
@@ -425,7 +461,7 @@ def _make_batched_step(diag, up, dn, hop, pairs, n):
             v[:, :, 1].add_(f[:, :, 0], alpha=up_c[i])
         for p, (i, j) in enumerate(pairs.tolist()):
             flipped = cur.view(R, 2 ** i, 2, 2 ** (j - i - 1), 2, -1).flip((2, 4)).reshape(R, dim)
-            y.addcmul_(torch.where(differ[p], hop[p, 1], hop[p, 0]), flipped)
+            y.addcmul_(torch.where(differ.get()[p], hop[p, 1], hop[p, 0]), flipped)
         if prev is None:
             out.copy_(y)
         else:

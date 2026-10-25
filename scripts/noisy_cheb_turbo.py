@@ -19,7 +19,15 @@
    kernel (per-row coefficient tables); see _TurboBatchV.
 Random numbers: one stream per trajectory, as noisy_cheb_fast: trajectories are the same as noisy_cheb_fast's (and
 noisy_cheb's) up to round-off, whatever the batching (self-check; the small kernel is checked on GPU).
-Self-check: python3 noisy_cheb_turbo.py (CPU, 3 atoms).
+
+Usage: as noisy_cheb / noisy_cheb_fast (same arguments and results), plus
+    bounds="lanczos" | "gershgorin"   spectral interval (Lanczos: fewer terms at larger n, guarded)
+    small_kernel=True                 single-launch series kernel on GPU for 2^n <= SMALL_DIM
+    vectorized=True                   batched jumps + Newton jump location (False: the first validated turbo)
+    res = noisy_cheb_turbo.simulate(seq, fresnel.default_noise_model, n_trajectories=2000,
+                                    eval_fractions=np.linspace(0, 1, 21), device="cuda")
+This is the engine to use; noisy_cheb (reference) and noisy_cheb_fast stay as the validated yardsticks.
+Self-check: python3 noisy_cheb_turbo.py (CPU, 3 atoms; the GPU kernels are checked by gpu_turbo_check.py).
 """
 from __future__ import annotations
 
@@ -78,7 +86,13 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
     stats = dict(trajectories=0, jumps=0, leaks=0, segments=0, matvecs=0, row_matvecs=0, jump_norm_dev=0.0,
                  max_growth=0.0, batches=0, lanczos_matvecs=0, lanczos_rejected=0, small_kernel_calls=0)
     if memory_bytes is None:
-        memory_bytes = 0.5 * torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else 2e9
+        if device.type == "cuda":
+            # return the caching allocator's free blocks first (as rydberg_cheb_fast): mem_get_info does not count
+            # them, and a run following another one would otherwise get smaller batches (found: turbo 2x slower)
+            torch.cuda.empty_cache()
+            memory_bytes = 0.4 * torch.cuda.mem_get_info(device)[0]  # headroom for allocator fragmentation
+        else:
+            memory_bytes = 2e9
     models, cache = [], {}
     for sd in sds:
         key = (id(sd.omega), id(sd.delta), id(sd.phi), sd.bad_atoms)
@@ -150,7 +164,8 @@ class _TurboBatch(fast._Batch):
     def ham(self, p, active):
         key = (p, active)
         if key not in self._hams:
-            if len(self._hams) > 64:
+            rows_h = 1 if self.shared_h else len(self.models)
+            if len(self._hams) >= ref._cache_entries(32 * rows_h * 2 ** int(sum(active))):
                 self._hams.clear()
             self._hams[key] = (self._build_rows(p, active, self._common_bounds(active)), None)
         return self._hams[key]
@@ -161,21 +176,19 @@ class _TurboBatch(fast._Batch):
         key = (p, active)
         if key in self._terms:
             return self._terms[key]
-        if len(self._terms) > 16:
-            self._terms.clear()
         models = [self.model] if self.shared_h else self.models
         idx = np.nonzero(active)[0]
         n = len(idx)
+        if len(self._terms) >= ref._cache_entries(8 * len(models) * 2 ** n):
+            self._terms.clear()
         omega = np.stack([m.pieces[p][2][idx] for m in models])
         delta = np.stack([m.pieces[p][3][idx] for m in models])
         phi = np.stack([m.pieces[p][4][idx] for m in models])
         mats = np.stack([m.pieces[p][5][:, idx][:, :, idx] for m in models])  # (R', K, n, n)
-        occupied = ryd._occupations(n, self.device)  # empty when every atom has leaked (one basis state left)
-        bits = (torch.stack([b.to(torch.float64) for b in occupied]) if n else
-                torch.zeros(0, 1, dtype=torch.float64, device=self.device))
+        bits = self._bits(n)
         ikey = (mats.tobytes(), active)
         if ikey not in self._inter_rows:
-            if len(self._inter_rows) > 8:
+            if len(self._inter_rows) >= ref._cache_entries(8 * len(models) * 2 ** n):
                 self._inter_rows.clear()
             diag = torch.zeros(len(models), 2 ** n, dtype=torch.float64, device=self.device)
             same, differ = np.zeros((len(models), n, n)), np.zeros((len(models), n, n))
@@ -183,9 +196,9 @@ class _TurboBatch(fast._Batch):
                 M = np.triu(mats[:, k], 1)
                 if np.allclose(O, np.diag(np.diag(O))):
                     d0, d1 = np.diag(O).real
-                    f = d0 + (d1 - d0) * bits
                     for i, j in zip(*np.nonzero(np.abs(M).max(0))):
-                        diag += torch.as_tensor(M[:, i, j], device=self.device)[:, None] * (f[i] * f[j])[None]
+                        f_ij = (d0 + (d1 - d0) * bits.row(i)) * (d0 + (d1 - d0) * bits.row(j))
+                        diag += torch.as_tensor(M[:, i, j], device=self.device)[:, None] * f_ij[None]
                 else:
                     same += M * (O[1, 0] ** 2).real
                     differ += M * abs(O[1, 0]) ** 2
@@ -193,11 +206,37 @@ class _TurboBatch(fast._Batch):
             hop = np.stack([same[:, pairs[:, 0], pairs[:, 1]], differ[:, pairs[:, 0], pairs[:, 1]]], -1)
             self._inter_rows[ikey] = (diag, pairs, hop.reshape(len(models), -1, 2))
         diag_int, pairs, hop = self._inter_rows[ikey]
-        diag = diag_int - torch.as_tensor(delta, device=self.device) @ bits
+        # per piece only the detunings change the diagonal: one (R', n) x (n, 2^n) product for all rows
+        diag = diag_int - bits.weighted(torch.as_tensor(delta, device=self.device))
         radius = np.abs(omega).sum(1) / 2 + (np.abs(hop).max(2).sum(1) if hop.shape[1] else 0.0)
         self._terms[key] = SimpleNamespace(diag=diag, omega=omega, phi=phi, hop=hop, pairs=pairs, bits=bits, n=n,
                                            radius=radius)
         return self._terms[key]
+
+    def _bits(self, n):
+        """Occupations of the n atoms: rows on the fly (never n float64 vectors kept per piece), and the products
+        sum_i c[r, i] n_i for all rows: one (R', n) x (n, 2^n) matrix product while the matrix is small (2^n <= 2^16),
+        otherwise a loop over the atoms."""
+        cache = self.__dict__.setdefault("_bits_cache", {})
+        if n not in cache:
+            index = torch.arange(2 ** n, device=self.device)
+            dense = (torch.stack([ref._occupation(index, n, i) for i in range(n)]) if 0 < n <= 16 else None)
+
+            class Bits:
+                def row(self_, i):
+                    return dense[i] if dense is not None else ref._occupation(index, n, i)
+
+                def weighted(self_, c):  # (R', n) -> (R', 2^n)
+                    if n == 0:
+                        return torch.zeros(c.shape[0], 1, dtype=torch.float64, device=c.device)
+                    if dense is not None:
+                        return c @ dense
+                    out = torch.zeros(c.shape[0], 2 ** n, dtype=torch.float64, device=c.device)
+                    for i in range(n):
+                        out += c[:, i:i + 1] * ref._occupation(index, n, i)
+                    return out
+            cache[n] = Bits()
+        return cache[n]
 
     def _common_bounds(self, active):
         cache = self.__dict__.setdefault("_bounds", {})
@@ -263,7 +302,7 @@ class _TurboBatch(fast._Batch):
         a_loc = self.model.g_loc - 0.5 * (lam[0] + lam[1]) * np.eye(2)
         diag = ((t.diag - center.real) / w).to(torch.complex128)
         for i in range(t.n):
-            diag += -1j * (a_loc[0, 0] + (a_loc[1, 1] - a_loc[0, 0]) * t.bits[i]) / w
+            diag += -1j * (a_loc[0, 0] + (a_loc[1, 1] - a_loc[0, 0]) * t.bits.row(i)) / w
         up = (t.omega / 2 * np.exp(1j * t.phi) - 1j * a_loc[1, 0]) / w
         dn = (t.omega / 2 * np.exp(-1j * t.phi) - 1j * a_loc[0, 1]) / w
         c = dict(dtype=self.dtype, device=self.device)
@@ -327,7 +366,9 @@ class _TurboBatch(fast._Batch):
                 k = max(int(below[0]) if below.size else m, 1)
                 if h.w * window[row] <= ref.PROBES_MAX - ref.PROBES_MIN:
                     tau[row] = offset[row] + ref._interpolated_root(nodes[a], norms[a], thresholds[row], k - 1)
-                    bracket_start[row] = states[a, k - 1]
+                    # a copy, not a view: a view would keep the whole (rows, probes, 2^n) block alive into the
+                    # next refinement pass (two blocks at once: out of memory at n = 20)
+                    bracket_start[row] = states[a, k - 1].clone()
                     left[row] = offset[row] + nodes[a, k - 1]
                 else:
                     refine.append(row)
@@ -420,16 +461,36 @@ class _TurboBatchV(_TurboBatch):
             return self._propagate_small(h, rows, psi, offsets_us)
         return fast._Batch._propagate(self, h, self._step(h, rows), psi, offsets_us)
 
-    def _expect_g(self, psi):
-        """<psi|G|psi> per row (G = sum_i g_loc(i)), real."""
+    @staticmethod
+    def _reduced_rows(psi, off_diagonal=True):
+        """Reduced 2 x 2 density matrices of every qubit for every row (unnormalised psi): (rho00, rho11, rho01), each
+        (R, n), rho01 = sum_x psi_x conj(psi_{x with bit i flipped}) over bit i = 0 (None if not requested).
+        Populations come from |psi|^2 reduced over strided views (no copy of the state); a per-qubit einsum would copy
+        and permute the whole state n times (3x slower than the reference engine's jump at n = 18)."""
         R, dim = psi.shape
         n = dim.bit_length() - 1
-        g = torch.as_tensor(self.model.g_loc, dtype=psi.dtype, device=psi.device)
-        total = torch.zeros(R, dtype=torch.float64, device=psi.device)
-        for i in range(n):
-            v = psi.view(R, 2 ** i, 2, -1)
-            total += torch.einsum("jabc,bd,jadc->j", v.conj(), g, v).real.double()
-        return total
+        p = psi.abs().square().double()
+        total = p.sum(1)
+        rho11 = torch.stack([p.view(R, 2 ** i, 2, -1)[:, :, 1].sum((1, 2)) for i in range(n)], 1)
+        rho01 = None
+        if off_diagonal:
+            rho01 = torch.stack([(psi.view(R, 2 ** i, 2, -1)[:, :, 0] * psi.view(R, 2 ** i, 2, -1)[:, :, 1].conj())
+                                 .sum((1, 2)).to(torch.complex128) for i in range(n)], 1)
+        return total[:, None] - rho11, rho11, rho01
+
+    @staticmethod
+    def _trace_with(op, rho00, rho11, rho01):
+        """Re Tr(op rho_i) for a 2 x 2 Hermitian op: (R, n)."""
+        out = op[0, 0].real * rho00 + op[1, 1].real * rho11
+        if rho01 is not None and abs(op[0, 1]) > 0:  # Tr(op rho) off-diagonal part: 2 Re(op_01 rho_10) = 2 Re(op_01 conj(rho_01))
+            out = out + 2 * (op[0, 1] * rho01.conj()).real
+        return out
+
+    def _expect_g(self, psi):
+        """<psi|G|psi> per row (G = sum_i g_loc(i)), real."""
+        g = self.model.g_loc
+        rho00, rho11, rho01 = self._reduced_rows(psi, off_diagonal=abs(g[0, 1]) > 0)
+        return self._trace_with(g, rho00, rho11, rho01).sum(1)
 
     def _segment(self, groups, p, t, t1):
         done: dict = {}
@@ -468,6 +529,8 @@ class _TurboBatchV(_TurboBatch):
         t = np.where(np.isfinite(t) & (t > 0) & (t < window), t, 0.5 * window)
         tau, out = np.zeros(J), [None] * J
         todo = np.arange(J)
+        # each pass: one batched series from the segment start to every unconverged row's current guess t, then
+        # Newton t <- t - (N - r) / N' (N' = -2 <G>), falling back to bisection when the step leaves the bracket
         for _ in range(self.NEWTON_MAX):
             states = self._propagate_rows(h, [jrows[a] for a in todo], psi0[todo], t[todo][:, None])[:, 0]
             N = states.abs().square().sum(1).double().cpu().numpy()
@@ -483,7 +546,7 @@ class _TurboBatchV(_TurboBatch):
             step = np.where(bad, 0.5 * (lo[todo] + hi[todo]), step)
             for a, row in enumerate(todo):
                 if converged[a]:
-                    tau[row], out[row] = t[row], states[a]
+                    tau[row], out[row] = t[row], states[a].clone()  # copy: a view would keep this pass's block
             t[todo] = np.where(converged, t[todo], step)
             todo = todo[~converged]
             if not len(todo):
@@ -491,7 +554,7 @@ class _TurboBatchV(_TurboBatch):
         else:  # bracket below round-off without |N - r| <= 1e-14 r: accept the last iterate
             states = self._propagate_rows(h, [jrows[a] for a in todo], psi0[todo], t[todo][:, None])[:, 0]
             for a, row in enumerate(todo):
-                tau[row], out[row] = t[row], states[a]
+                tau[row], out[row] = t[row], states[a].clone()
         psi_tau = torch.stack(out)
         dev = np.abs(psi_tau.abs().square().sum(1).double().cpu().numpy() - thresholds).max()
         self.stats["jump_norm_dev"] = max(self.stats["jump_norm_dev"], float(dev))
@@ -503,11 +566,10 @@ class _TurboBatchV(_TurboBatch):
         psi = psi_tau.to(torch.complex128)
         J, dim = psi.shape
         n = dim.bit_length() - 1
-        ldl = torch.as_tensor(np.stack(model.jump_ldl), dtype=torch.complex128, device=psi.device)  # (K, 2, 2)
         n_ops = len(model.jump_ldl)
-        rho = torch.stack([torch.einsum("jabc,jadc->jbd", v, v.conj())
-                           for v in (psi.view(J, 2 ** i, 2, -1) for i in range(n))], 1)  # (J, n, 2, 2)
-        weights = torch.einsum("kbd,jidb->jik", ldl, rho).real.clamp(min=0).reshape(J, n * n_ops).cpu().numpy()
+        rho00, rho11, rho01 = self._reduced_rows(psi, off_diagonal=any(abs(L[0, 1]) > 0 for L in model.jump_ldl))
+        weights = torch.stack([self._trace_with(L, rho00, rho11, rho01) for L in model.jump_ldl], 2)  # (J, n, K)
+        weights = weights.clamp(min=0).reshape(J, n * n_ops).cpu().numpy()
         choice = np.empty(J, int)
         for a, row in enumerate(jrows):  # each row's stream, noisy_cheb's arithmetic
             w = weights[a]
@@ -519,10 +581,13 @@ class _TurboBatchV(_TurboBatch):
         for c in np.unique(choice):
             sub = np.nonzero(choice == c)[0]
             i, k = divmod(int(c), n_ops)
-            if k < len(model.inside):
-                L = torch.as_tensor(model.inside[k][:2, :2], dtype=torch.complex128, device=psi.device)
+            if k < len(model.inside):  # L on qubit i: new_b = L_b0 v_0 + L_b1 v_1 on the two halves (no permute)
+                L = model.inside[k][:2, :2]
                 v = psi[sub].view(len(sub), 2 ** i, 2, -1)
-                new[sub] = torch.einsum("bc,jacd->jabd", L, v).reshape(len(sub), dim)
+                out = new[sub].view(len(sub), 2 ** i, 2, -1)
+                for b in (0, 1):
+                    out[:, :, b] = complex(L[b, 0]) * v[:, :, 0] + complex(L[b, 1]) * v[:, :, 1]
+                new[sub] = out.reshape(len(sub), dim)
             else:
                 leaks.extend((a, i, k - len(model.inside)) for a in sub)
         keep = np.setdiff1d(np.arange(J), [a for a, _, _ in leaks])
@@ -553,8 +618,7 @@ def _rowwise_step(diag, up, dn, hop, pairs, n):
     """step(cur, prev, out) on (R, 2^n) rows, row r with its own H~: diag (R, 2^n), up / dn (R, n), hop (R, P, 2)."""
     R, dim = diag.shape
     device = diag.device
-    index = torch.arange(dim, device=device)
-    differ = [((index >> (n - 1 - i)) ^ (index >> (n - 1 - j))) & 1 == 1 for i, j in pairs.tolist()]
+    differ = ref._parity_masks(pairs, n, device)  # built on the first torch step only
     dn_c, up_c = dn[:, :, None, None], up[:, :, None, None]
 
     def torch_step(cur, prev, out):
@@ -565,7 +629,7 @@ def _rowwise_step(diag, up, dn, hop, pairs, n):
             v[:, :, 1].addcmul_(up_c[:, i], f[:, :, 0])
         for p, (i, j) in enumerate(pairs.tolist()):
             flipped = cur.view(R, 2 ** i, 2, 2 ** (j - i - 1), 2, -1).flip((2, 4)).reshape(R, dim)
-            y.addcmul_(torch.where(differ[p], hop[:, p, 1:], hop[:, p, :1]), flipped)
+            y.addcmul_(torch.where(differ.get()[p], hop[:, p, 1:], hop[:, p, :1]), flipped)
         if prev is None:
             out.copy_(y)
         else:
@@ -764,6 +828,9 @@ if __name__ == "__main__":
     _TurboBatchV._propagate_rows = lambda self, h, rows, psi, off: fast._Batch._propagate(
         self, h, self._step(h, rows), psi, np.asarray(off, float))
     compare("4b. Newton jump location forced on CPU", samples, bounds="lanczos")
+    weird = 1.5 * np.array([[0.3, 0.5 + 0.2j], [0.1j, -0.2]])  # general eff_noise: L^dag L has off-diagonal terms
+    general = [dataclasses.replace(sd, lindblad_ops=[torch.as_tensor(weird)]) for sd in samples]
+    compare("4c. general eff_noise (off-diagonal L^dag L), Newton forced", general, bounds="lanczos")
     LANCZOS_MARGIN = -0.3  # interval deliberately too narrow: the guard must reject it and fall back
     _, b = compare("5. too-narrow Lanczos interval (guard)", samples, bounds="lanczos")
     assert b.stats["lanczos_rejected"] >= 1
