@@ -27,7 +27,7 @@ Usage: as noisy_cheb / noisy_cheb_fast (same arguments and results), plus
     res = noisy_cheb_turbo.simulate(seq, fresnel.default_noise_model, n_trajectories=2000,
                                     eval_fractions=np.linspace(0, 1, 21), device="cuda")
 This is the engine to use; noisy_cheb (reference) and noisy_cheb_fast stay as the validated yardsticks.
-Self-check: python3 noisy_cheb_turbo.py (CPU, 3 atoms; the GPU kernels are checked by gpu_turbo_check.py).
+Self-check: python3 noisy_cheb_turbo.py (CPU, 3 atoms; the GPU kernels are checked by cluster/gpu_turbo_check.py).
 """
 from __future__ import annotations
 
@@ -539,7 +539,10 @@ class _TurboBatchV(_TurboBatch):
             above = N > r
             lo[todo] = np.where(above, t[todo], lo[todo])
             hi[todo] = np.where(above, hi[todo], t[todo])
-            converged = (np.abs(N - r) <= 1e-14 * np.maximum(r, 1e-300)) | (hi[todo] - lo[todo] <= 4e-16 * window[todo])
+            # tolerances at the working precision: in complex64 the norm is only good to ~1e-7, and float64 criteria
+            # would never be met (every jump ran NEWTON_MAX iterations: complex64 3x slower than complex128 at n = 10)
+            tol, btol = (1e-14, 4e-16) if self.dtype == torch.complex128 else (3e-6, 1e-6)
+            converged = (np.abs(N - r) <= tol * np.maximum(r, 1e-300)) | (hi[todo] - lo[todo] <= btol * window[todo])
             with np.errstate(divide="ignore", invalid="ignore"):
                 step = t[todo] - (N - r) / dN
             bad = ~np.isfinite(step) | (step <= lo[todo]) | (step >= hi[todo])

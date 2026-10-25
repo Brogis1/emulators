@@ -11,7 +11,7 @@
 date; hostname
 module purge; module load devel/python/3.12.11
 source /work/isokolov/heisenberg_cheb/.venv/bin/activate
-cd /work/isokolov/heisenberg_cheb/emulators/scripts
+cd /work/isokolov/heisenberg_cheb/emulators/scripts/notebooks
 export FRESNEL_SPECS=/work/isokolov/heisenberg_cheb/fresnel_specs.json CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=8
 sed 's/FULL = False  #/FULL = True  #/' noisy_cheb_benchmark.ipynb > noisy_cheb_benchmark_full.ipynb
 grep -c "FULL = True" noisy_cheb_benchmark_full.ipynb

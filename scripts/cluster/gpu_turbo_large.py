@@ -1,5 +1,9 @@
 """noisy_cheb_turbo at larger registers (A100): exactness vs noisy_cheb_fast at n=16 (same streams), then ms/trajectory
 and matvecs per trajectory for fast, turbo (Lanczos) and turbo (Gershgorin), FRESNEL noise, 4 us, 11 output times."""
+import os  # noqa: E402
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/: the engines
 import os
 import time
 import warnings

@@ -19,7 +19,8 @@ import traceback
 
 root = sys.argv[1]
 scripts = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, scripts)
+sys.path.insert(0, os.path.join(scripts, "experiments"))  # tiled_step, multi_gpu
+sys.path.insert(0, scripts)  # the engines
 os.chdir(scripts)
 for sub in ("inbox", "outbox"):
     os.makedirs(os.path.join(root, sub), exist_ok=True)
@@ -27,13 +28,15 @@ WATCHED = ["rydberg_cheb_fast", "noisy_cheb", "noisy_cheb_fast", "noisy_cheb_tur
            "tiled_step", "multi_gpu"]  # dependency order
 mtimes: dict = {}
 G: dict = {"__name__": "task"}
+G["G"] = G  # tasks reach the persistent namespace as G
 
 
 def reload_changed():
     stale = False
     for name in WATCHED:
-        path = os.path.join(scripts, name + ".py")
-        if not os.path.exists(path):
+        path = next((q for q in (os.path.join(scripts, name + ".py"), os.path.join(scripts, "experiments", name + ".py"))
+                     if os.path.exists(q)), None)
+        if path is None:
             continue
         m = os.path.getmtime(path)
         if mtimes.get(name) != m:

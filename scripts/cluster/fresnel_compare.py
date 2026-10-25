@@ -1,5 +1,9 @@
 """Three-way FRESNEL check: emu-mps (array results), noisy_cheb_fast, exact dense Lindblad; occupations and, with
-readout errors, bitstring frequencies. Usage (scripts dir): python fresnel_compare.py RESULTS_DIR [n_cheb]"""
+readout errors, bitstring frequencies. Usage (scripts dir): python cluster/fresnel_compare.py RESULTS_DIR [n_cheb]"""
+import os  # noqa: E402
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/: the engines
 import glob
 import sys
 import warnings

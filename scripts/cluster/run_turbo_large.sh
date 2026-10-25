@@ -14,5 +14,5 @@ module purge; module load devel/python/3.12.11
 source /work/isokolov/heisenberg_cheb/.venv/bin/activate
 cd /work/isokolov/heisenberg_cheb/emulators/scripts
 export FRESNEL_SPECS=/work/isokolov/heisenberg_cheb/fresnel_specs.json
-python gpu_turbo_large.py
+python cluster/gpu_turbo_large.py
 date

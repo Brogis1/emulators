@@ -1,4 +1,8 @@
 """n=18: fast vs turbo interleaved (fast, turbo, fast, turbo) on the same samples, with time split by component."""
+import os  # noqa: E402
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/: the engines
 import os
 import time
 import warnings

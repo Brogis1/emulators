@@ -1,5 +1,9 @@
 """One array task: 100 emu-mps trajectories of a FRESNEL noise case (noisy_vs_emu_mps setup); saves occupations and
-final bitstring counts. Usage (scripts dir): python fresnel_mps_task.py CASE TASK_ID OUT_DIR"""
+final bitstring counts. Usage (scripts dir): python cluster/fresnel_mps_task.py CASE TASK_ID OUT_DIR"""
+import os  # noqa: E402
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/: the engines
 import logging, os, sys, warnings
 import torch
 warnings.filterwarnings("ignore")

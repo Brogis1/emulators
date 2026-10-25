@@ -1,5 +1,9 @@
 """Quick GPU check of noisy_cheb_turbo (small n): small-register series kernel and per-row (shot-to-shot) kernels vs
-noisy_cheb_fast trajectory by trajectory (same streams), then ms/trajectory. Usage (scripts dir): python gpu_turbo_check.py"""
+noisy_cheb_fast trajectory by trajectory (same streams), then ms/trajectory. Usage (scripts dir): python cluster/gpu_turbo_check.py"""
+import os  # noqa: E402
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/: the engines
 import os
 import time
 import warnings

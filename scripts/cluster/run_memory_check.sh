@@ -16,6 +16,6 @@ cd /work/isokolov/heisenberg_cheb/emulators/scripts
 export FRESNEL_SPECS=/work/isokolov/heisenberg_cheb/fresnel_specs.json
 python -W ignore noisy_cheb.py | tail -6
 python -W ignore heisenberg_cheb_fast.py | tail -4
-python gpu_memory_check.py
-python gpu_turbo_check.py | grep -c "vec=True"
+python cluster/gpu_memory_check.py
+python cluster/gpu_turbo_check.py | grep -c "vec=True"
 date

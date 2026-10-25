@@ -14,8 +14,8 @@ module purge; module load devel/python/3.12.11
 source /work/isokolov/heisenberg_cheb/.venv/bin/activate
 cd /work/isokolov/heisenberg_cheb/emulators/scripts
 export FRESNEL_SPECS=/work/isokolov/heisenberg_cheb/fresnel_specs.json
-NQ=18 python bench_large_interleaved.py | grep rep
-NQ=20 python bench_large_interleaved.py | grep rep
-python gpu_turbo_check.py
-python gpu_turbo_large.py
+NQ=18 python experiments/bench_large_interleaved.py | grep rep
+NQ=20 python experiments/bench_large_interleaved.py | grep rep
+python cluster/gpu_turbo_check.py
+python cluster/gpu_turbo_large.py
 date

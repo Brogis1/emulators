@@ -15,4 +15,4 @@ cd /work/isokolov/heisenberg_cheb/emulators/scripts
 export FRESNEL_SPECS=/work/isokolov/heisenberg_cheb/fresnel_specs.json CUDA_VISIBLE_DEVICES=""
 cases=(fresnel_relaxation fresnel_full)
 case=${cases[$((SLURM_ARRAY_TASK_ID / 20))]}
-python fresnel_mps_task.py $case $((SLURM_ARRAY_TASK_ID % 20)) /work/isokolov/heisenberg_cheb/fresnel_mps
+python cluster/fresnel_mps_task.py $case $((SLURM_ARRAY_TASK_ID % 20)) /work/isokolov/heisenberg_cheb/fresnel_mps

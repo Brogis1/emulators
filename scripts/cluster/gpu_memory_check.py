@@ -1,6 +1,10 @@
 """GPU memory check of every engine at large registers: peak allocated memory against the free memory, with a
 time-dependent drive (one piece per 10 ns step: exercises the Hamiltonian caches) and FRESNEL's noise, each run twice
-in the same process (no growth between runs). Usage (scripts dir, A100): python gpu_memory_check.py"""
+in the same process (no growth between runs). Usage (scripts dir, A100): python cluster/gpu_memory_check.py"""
+import os  # noqa: E402
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/: the engines
 import os
 import time
 import warnings
