@@ -38,6 +38,7 @@ ENGINE, SINGLE = "reference", False
 CACHE = os.environ.get("EMU_MPS_CACHE", "/tmp/heis_gpu/emu_cache")
 FRESNEL_SPECS = os.environ.get("FRESNEL_SPECS", os.path.expanduser("~/.cache/pasqal/fresnel_specs.json"))
 DT, FRACTIONS, SHOTS = 10, np.linspace(0, 1, 11), 2000
+N_SPREAD = 20000  # trajectories of the separate sample that sets the standard errors (random channels)
 LEAK = np.zeros((3, 3))
 LEAK[2, 0] = 1.0  # pulser basis (r, g, x): |x><r|
 
@@ -212,8 +213,13 @@ def run(name, n_traj, cheb_factor, noiseless_cache={}):
         line += f"per-trajectory max |d<n>| {diff:.1e}  noise effect {effect:.3f}"
         verdict = diff < 1e-3
     else:
+        # standard errors from the per-trajectory spread of a large separate sample (N_SPREAD turbo trajectories):
+        # both codes sample the same quantum-jump trajectories, and a sample's own spread misses rare early jumps
+        # (e.g. < 1 relaxation among 200 trajectories at 100 ns with FRESNEL's 0.01 / us), which inflated z
+        big = noisy_cheb_turbo.run_sequence_data(sds * max(1, N_SPREAD // len(sds)), FRACTIONS, seed=99)
+        spread = big.occupations.double().std(0)
         m1, m2 = occ_mps.mean(0), occ_cheb.mean(0)
-        se = (occ_mps.var(0) / len(occ_mps) + occ_cheb.var(0) / len(occ_cheb)).sqrt().clamp(min=1e-4)
+        se = (spread * (1 / len(occ_mps) + 1 / len(occ_cheb)) ** 0.5).clamp(min=1e-6)
         z = float(((m1 - m2).abs() / se).max())
         line += (f"max |d<n>| {float((m1 - m2).abs().max()):.4f}  max z {z:.1f} ({m1.numel()} values)  "
                  f"noise effect {effect:.3f} = {effect / float(se.max()):.0f} std. err.")
