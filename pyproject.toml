@@ -29,7 +29,7 @@ dependencies = [
 dynamic = ["version"]
 
 [tool.setuptools]
-packages = ["emu_base", "emu_mps", "emu_sv"]
+packages = ["emu_base", "emu_mps", "emu_sv", "emu_cheb", "emu_cheb.solvers"]
 
 [tool.coverage.run]
 branch = true
