@@ -5,7 +5,7 @@
 [`emu_cheb.solvers`](solvers/README.md) (validated against emu-mps for every noise channel and FRESNEL's noise
 model; algorithms, validation and timings there); `ChebBackend` only translates. Status: experimental.
 
-Authors: Igor Sokolov & Mathieu Garrigues
+Authors: Igor Sokolov & Mathieu Garrigues (contributor that created the basic approach that was generalized here to other Hamiltonians and implemented for noisy simulations)
 
 ## Speed
 
