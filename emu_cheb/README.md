@@ -56,7 +56,7 @@ operators are emu-sv's (`StateVector`, `DenseOperator`, re-exported here).
 | `optimization=` | runs (in `emu_cheb.solvers`) | handles |
 |---|---|---|
 | `"auto"` (default) | `"quench"` if the run allows it, else `"turbo"` | everything |
-| `"quench"` | `rydberg_cheb_fast.evolve` (Rydberg), `heisenberg_cheb_fast.evolve` (Heisenberg stack) | noiseless, constant drive, phase 0, from the ground state; real float64 series, the fastest; off-diagonal observables through its `on_state` hook (no array of states) |
+| `"quench"` | `rydberg_cheb_fast.evolve` (Rydberg), `heisenberg_cheb_fast.evolve` (Heisenberg stack, pulser XY) | noiseless, constant drive, phase 0, from the ground state; real float64 series, the fastest; off-diagonal observables through its `on_state` hook (no array of states) |
 | `"turbo"` | `noisy_cheb_turbo.run_sequence_data` | any pulse, phase, local addressing / DMM / SLM, every noise channel, Rydberg / XY / Heisenberg |
 | `"fast"` | `noisy_cheb_fast.run_sequence_data` | same as turbo, same trajectories (validated yardstick) |
 | `"reference"` | `noisy_cheb.run_sequence_data` | same physics, one trajectory at a time (validated yardstick; its random stream is laid out differently, so it agrees with fast / turbo statistically, not trajectory by trajectory) |
@@ -67,7 +67,10 @@ naming the first that fails:
 - the drive and the interaction are constant over the whole sequence (one piece: no pulse shape, no SLM mask);
 - laser phase 0 (the quench solvers need a real H);
 - initial state all ground;
-- Rydberg mode, or a `heisenberg=` stack (pulser's XY mode goes to turbo).
+
+All three interaction modes (Rydberg, XY, Heisenberg) run on every engine. For `"quench"`, pulser's XY stack
+[C3, C6] is mapped exactly onto the Heisenberg solver: J^xx = J^yy = C3/2, J^zz = C6/4, δ_i → δ_i + Σ_j C6_ij/2
+(|u⟩⟨u| = 1 − n turns C6 |uu⟩⟨uu| into C6/4 Z_iZ_j plus detuning shifts and a constant, i.e. a global phase).
 
 **Can the Heisenberg solver run Rydberg?** Yes: with n = (1 − Z)/2, Σ J_ij n_i n_j = Σ J_ij/4 Z_i Z_j + Σ_i (Σ_j
 J_ij/2) n_i + const (`heisenberg_cheb_fast.rydberg_as_heisenberg`), equal up to a global phase, so probabilities are
@@ -126,6 +129,15 @@ $$H(t) = \sum_i \frac{\Omega_i(t)}{2}\left(\cos\phi_i X_i + \sin\phi_i Y_i\right
 
 In both cases the drive keeps the form above (X, Y and n of each atom).
 
+**XY model with any couplings.** The interaction is just a matrix, so the XY model
+$\sum_{i<j} \frac{J_{ij}}{2}(X_iX_j + Y_iY_j)$ on any graph takes either
+- pulser's XY channel (`mw_global`) with `ChebConfig(interaction_matrix=np.stack([J, C6]))`: pulser / emu-base want
+  the 2-layer XY stack (a plain (n, n) matrix is rejected); `C6 = 0` gives the pure XY model, and without
+  `interaction_matrix` pulser uses the register's dipolar $C_3$ couplings and $C_6/r^6$ shift; or
+- `ChebConfig(heisenberg=np.stack([J / 2, J / 2, Jzz]))` on any sequence (`Jzz = 0`: XY; otherwise XXZ).
+
+Both are checked against dense evolution for every engine (`test_backend.py`, `examples/emu_cheb/xy.ipynb`).
+
 ## Noise
 
 The noise model is pulser's `NoiseModel` (or the device's with `prefer_device_noise_model=True`), sampled by
@@ -171,7 +183,9 @@ free memory and size their batches to it. Algorithms, validation and timings: [`
 `examples/emu_cheb/`: `quench_emu_cheb.ipynb` and `noisy_quench_emu_cheb.ipynb` (emu-sv's tutorials with the backend
 swapped, compared with emu-sv: 16-atom quench 4e-11 and 10× faster; noisy quench within statistical error of emu-sv's
 Lindblad solver), `heisenberg.ipynb` (`examples/emu_mps/heisenberg.ipynb` with `heisenberg=`: round-off against the
-exact state vector, energies included; noisy runs against the exact Lindblad equation).
+exact state vector, energies included; noisy runs against the exact Lindblad equation), `xy.ipynb` (the XY model on a
+custom coupling graph, N = 4: pulser's XY channel with a custom `interaction_matrix`, the Heisenberg-stack route,
+pulser's default couplings, single-excitation hopping, every engine incl. quench, noise against exact Lindblad).
 
 ## Tests
 

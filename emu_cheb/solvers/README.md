@@ -32,7 +32,7 @@ test/emu_cheb/
 ├── validation/                    noisy_vs_emu_mps.py harness, FRESNEL job array and comparison
 └── cluster/                       pasqal-dgx: Slurm templates, persistent GPU test runner, GPU checks
 examples/emu_cheb/
-├── quench_emu_cheb.ipynb  noisy_quench_emu_cheb.ipynb  heisenberg.ipynb    ChebBackend examples
+├── quench_emu_cheb.ipynb  noisy_quench_emu_cheb.ipynb  heisenberg.ipynb  xy.ipynb    ChebBackend examples
 ├── benchmarks/                    engine-level notebooks: exact targets, emu-mps comparison, timings
 └── experiments/                   ideas tried but not adopted (yet): tiled kernel, multi-GPU driver
 ```

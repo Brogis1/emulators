@@ -148,21 +148,29 @@ def quench_blocker(sds, initial) -> str | None:
         return "the initial state is not all ground"
     if bool((torch.as_tensor(sd.phi).real != 0).any()):
         return "a non-zero laser phase (the quench solvers need a real H)"
-    if sd.hamiltonian_type != HamiltonianType.Rydberg and sd.interaction_matrix(0.0).shape[0] != 3:
-        return "pulser's XY mode (the quench solvers take Rydberg or a heisenberg= stack)"
     if len(noisy_cheb._Model(sd, torch.device("cpu")).pieces) != 1:
         return "a time-dependent drive or interaction (pulse shape, SLM mask)"
     return None
 
 
 def run_quench(sds, times_ns, device, bounds, hook) -> noisy_cheb.NoisyResults:
-    """The noiseless constant-H run by rydberg_cheb_fast (Rydberg) or heisenberg_cheb_fast (Heisenberg stack), as a
-    NoisyResults whose trajectories are all this one (the samples are identical). Probabilities at every output time;
-    psi only through the solver's on_state hook, i.e. while the series holds it (no T x 2^n array of states)."""
+    """The noiseless constant-H run by rydberg_cheb_fast (Rydberg) or heisenberg_cheb_fast (Heisenberg stack, pulser
+    XY), as a NoisyResults whose trajectories are all this one (the samples are identical). Probabilities at every
+    output time; psi only through the solver's on_state hook, i.e. while the series holds it (no T x 2^n states).
+
+    Pulser's XY mode [C3, C6] is a Heisenberg H up to a constant (a global phase): C3 (X X + Y Y) / 2 is
+    Jxx = Jyy = C3 / 2, and with |u><u| = 1 - n, C6 (1 - n_i)(1 - n_j) = C6 / 4 Z_i Z_j - C6 / 2 (n_i + n_j) + const,
+    i.e. Jzz = C6 / 4 and delta_i -> delta_i + sum_j C6_ij / 2 (as heisenberg_cheb_fast.rydberg_as_heisenberg)."""
     model = noisy_cheb._Model(sds[0], device)
     _, _, omega, delta, _, mat = model.pieces[0]
     n = model.n_total
-    solver, J = (rydberg_cheb_fast, mat[0]) if len(mat) == 1 else (heisenberg_cheb_fast, mat)
+    if len(mat) == 1:  # Rydberg: J n n
+        solver, J = rydberg_cheb_fast, mat[0]
+    elif np.allclose(model.ops[2], np.diag([1.0, 0.0])):  # pulser XY: [C3, C3, C6] on (X/sqrt2, Y/sqrt2, |u><u|)
+        solver, J = heisenberg_cheb_fast, np.stack([mat[0] / 2, mat[1] / 2, mat[2] / 4])
+        delta = delta + mat[2].sum(-1) / 2
+    else:  # Heisenberg stack [Jxx, Jyy, Jzz] on (X, Y, Z)
+        solver, J = heisenberg_cheb_fast, mat
     stats: dict = {}
     active = np.ones(n, bool)
     out = solver.evolve(

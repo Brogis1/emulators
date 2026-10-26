@@ -94,11 +94,24 @@ def test_noiseless_rydberg_matches_emu_sv():
     assert torch.allclose(connected(occ, corr), corr - occ[:, None] * occ[None, :])
 
 
+PAIRS = [(i, j) for i in range(N) for j in range(i + 1, N)]
+PU = torch.diag(torch.tensor([1.0, 0.0], dtype=torch.complex128))  # |u><u| (index 0)
+
+
 def dense_heisenberg_occupations(sd, J3):
     """<n_i> at every grid time: H = drive + sum_{i<j} Jxx XX + Jyy YY + Jzz ZZ (Pauli matrices, independent of the
     engines), one dense exponential per drive step."""
-    pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
-    H_int = sum(J3[a, i, j] * op(P, i) @ op(P, j) for a, P in enumerate((X, Y, Z)) for i, j in pairs)
+    return dense_occupations(sd, sum(J3[a, i, j] * op(P, i) @ op(P, j) for a, P in enumerate((X, Y, Z)) for i, j in PAIRS))
+
+
+def dense_xy_occupations(sd, C3, C6):
+    """As dense_heisenberg_occupations for pulser's XY interaction: C3_ij / 2 (XX + YY) + C6_ij |uu><uu|."""
+    H_int = sum(C3[i, j] / 2 * (op(X, i) @ op(X, j) + op(Y, i) @ op(Y, j)) + C6[i, j] * op(PU, i) @ op(PU, j) for i, j in PAIRS)
+    return dense_occupations(sd, H_int)
+
+
+def dense_occupations(sd, H_int):
+    """<n_i> at every grid time under drive + H_int, from |0...0>, one dense exponential per drive step."""
     psi = torch.zeros(2**N, dtype=torch.complex128)
     psi[0] = 1.0
     occ = [torch.stack([torch.vdot(psi, op(NUM, q) @ psi).real for q in range(N)])]
@@ -131,6 +144,50 @@ def test_heisenberg_matches_dense(kind):
     grid = np.asarray(sd.target_times) / sd.target_times[-1]
     rows = [int(np.argmin(np.abs(grid - t))) for t in TIMES]
     assert torch.allclose(stacked(res, "occupation"), dense_heisenberg_occupations(sd, J3)[rows], atol=1e-8)
+
+
+@pytest.mark.parametrize("route", ["pulser_xy", "heisenberg_stack"])
+def test_xy_model_custom_couplings_matches_dense(route):
+    """XY model sum_{i<j} J_ij (X_i X_j + Y_i Y_j) / 2 on any graph: pulser's XY channel with a custom
+    interaction_matrix [J, C6 = 0], or the Heisenberg stack [J/2, J/2, 0]; both against dense evolution."""
+    J = torch.tensor([[0, 3.0, 0.4, 1.0], [3.0, 0, 2.0, 0], [0.4, 2.0, 0, 1.5], [1.0, 0, 1.5, 0]], dtype=torch.float64)
+    seq = xy_sequence()
+    extra = (
+        {"interaction_matrix": np.stack([J.numpy(), np.zeros((N, N))])}
+        if route == "pulser_xy"
+        else {"heisenberg": np.stack([J.numpy() / 2, J.numpy() / 2, np.zeros((N, N))])}
+    )
+    config = ChebConfig(observables=[Occupation(evaluation_times=TIMES)], **extra, **QUIET)
+    res = ChebBackend(seq, config=config).run()
+    (sd,) = PulserData(sequence=seq, config=config, dt=10).get_sequences()
+    J3 = torch.stack([J / 2, J / 2, torch.zeros_like(J)])
+    grid = np.asarray(sd.target_times) / sd.target_times[-1]
+    rows = [int(np.argmin(np.abs(grid - t))) for t in TIMES]
+    assert torch.allclose(stacked(res, "occupation"), dense_heisenberg_occupations(sd, J3)[rows], atol=1e-8)
+
+
+@pytest.mark.parametrize("couplings", ["custom", "pulser_default"])
+@pytest.mark.parametrize("optimization", ["reference", "fast", "turbo", "quench"])
+def test_xy_mode_every_engine_matches_dense(couplings, optimization):
+    """Pulser's XY mode with a constant drive from the ground state: every engine (quench through the Heisenberg
+    mapping Jxx = Jyy = C3 / 2, Jzz = C6 / 4, delta + sum_j C6_ij / 2), custom [C3, C6] couplings with a non-zero C6
+    layer, and pulser's default dipolar stack."""
+    seq = xy_sequence(shaped=False)
+    if couplings == "custom":
+        C3 = torch.tensor([[0, 3.0, 0.4, 1.0], [3.0, 0, 2.0, 0], [0.4, 2.0, 0, 1.5], [1.0, 0, 1.5, 0]], dtype=torch.float64)
+        C6 = 0.7 * (C3 > 1).double()
+        extra = {"interaction_matrix": torch.stack([C3, C6]).numpy()}
+    else:
+        extra = {}
+    config = ChebConfig(observables=[Occupation(evaluation_times=TIMES)], optimization=optimization, **extra, **QUIET)
+    backend = ChebBackend(seq, config=config)
+    res = backend.run()
+    assert backend.raw.stats["optimization"] == optimization
+    (sd,) = PulserData(sequence=seq, config=config, dt=10).get_sequences()
+    C3, C6 = sd.interaction_matrix(0.0).real.double()
+    grid = np.asarray(sd.target_times) / sd.target_times[-1]
+    rows = [int(np.argmin(np.abs(grid - t))) for t in TIMES]
+    assert torch.allclose(stacked(res, "occupation"), dense_xy_occupations(sd, C3, C6)[rows], atol=1e-8)
 
 
 def test_noisy_matches_emu_sv_lindblad():
