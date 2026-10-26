@@ -216,6 +216,15 @@ class MPO(Operator[complex, torch.Tensor, MPS]):
                     1, dim, dim, 1
                 ),
             }
+        elif basis == {"u", "d"}:
+            # pulser's XY basis, u -> 0 and d -> 1; "du" is |d><u|
+            eye = torch.eye(2, dtype=dtype)
+            idx = {"u": 0, "d": 1}
+            operators_with_tensors = {
+                a + b: torch.outer(eye[i], eye[j]).view(1, 2, 2, 1)
+                for a, i in idx.items()
+                for b, j in idx.items()
+            }
         elif basis == {"r", "g", "x"}:
             # operators_with_tensors will now contain the basis for single
             # qubit ops, and potentially user defined strings in terms of these

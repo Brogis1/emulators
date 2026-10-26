@@ -48,7 +48,7 @@ class MPS(State[complex, torch.Tensor]):
             - If False, all factors are placed on CPU.
             - If None (the default), factors retain their current device
             assignment. All factors must be on the same device.
-        eigenstates: the basis states for each qudit (['0','1'] or ['r','g'])
+        eigenstates: the basis states for each qudit (['0','1'], ['r','g'] or ['u','d'])
             or qutrit ['g','r','x'], where 'x' is the leakage state
             (default: ['0','1'])
     """
@@ -141,7 +141,7 @@ class MPS(State[complex, torch.Tensor]):
         else:
             raise ValueError(
                 "Unsupported basis provided. The supported "
-                "bases are:{('0','1'),('r','g'),('r','g','x')}"
+                "bases are:{('0','1'),('r','g'),('u','d'),('r','g','x')}"
             )
 
         return cls(
@@ -241,7 +241,7 @@ class MPS(State[complex, torch.Tensor]):
         Returns:
             the measured bitstrings, by count
         """
-        assert one_state in {None, "r", "1"}
+        assert one_state in {None, "r", "1", "d"}
         self.orthogonalize(0)
 
         bitstrings: Counter[str] = Counter()
@@ -447,6 +447,8 @@ class MPS(State[complex, torch.Tensor]):
             pass
         elif basis == {"0", "1"}:
             one = "1"
+        elif basis == {"u", "d"}:  # pulser's XY basis: u -> 0, d -> 1
+            one = "d"
         elif basis == {"g", "r", "x"}:
             leak = "x"
         else:
@@ -552,7 +554,7 @@ class MPS(State[complex, torch.Tensor]):
         """
         Efficiently compute the symmetric correlation matrix
         $C_{ij} = \\langle \\text{self}|\\text{operator}_i \\text{operator}_j|\\text{self}\\rangle$
-        in basis ("r", "g"), ("0","1"), and ("r","g","x").
+        in basis ("r", "g"), ("0","1"), ("u","d"), and ("r","g","x").
 
         Args:
             operator: a 2x2 (or 3x3) Torch tensor to use

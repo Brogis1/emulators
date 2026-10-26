@@ -358,7 +358,7 @@ def test_from_string_afm_state_3level_system_leak():
 
 @pytest.mark.parametrize(
     ("zero", "one"),
-    (("g", "r"), ("0", "1")),
+    (("g", "r"), ("0", "1"), ("u", "d")),
 )
 def test_from_string_not_normalized_state(capfd, zero, one):
     MPSConfig()
@@ -600,6 +600,7 @@ def test_correlation_matrix_random(basis):
         (("0", "1"), {4 * "0": 1.0}),
         (("r", "g"), {4 * "r": 1.0}),
         (("r", "g"), {4 * "g": 1.0}),
+        (("u", "d"), {"udud": 1.0}),
         (("r", "g", "x"), {4 * "x": 1.0}),
     ],
 )

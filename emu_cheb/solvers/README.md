@@ -223,9 +223,19 @@ Shot-to-shot noise (amplitude, Doppler + Lindblad), 2 µs, n = 8–12: turbo 9.6
 noisy_cheb_fast (which cannot batch samples with different H). From n ≈ 18 both are limited by memory traffic of the
 same kernels; turbo keeps 5–15 % (Lanczos bounds, cheaper jumps).
 
-Further factors (measured): `single=True` 1.37× (n = 10), 1.77× (n = 20), 1.92× (n = 22) end-to-end, means within
-~5e-7 of complex128; two GPUs (`examples/emu_cheb/experiments/multi_gpu.py`) 1.62× wall / 1.79× compute on an 80 s run (n = 18), plus
-~4.5 s of worker start-up.
+What each step contributes (measured, from the tables above and the runs cited):
+
+| step | gain |
+|---|---|
+| fast vs reference (batched trajectories, jump detection at segment ends) | 17–23× at n = 8–12, 5× at n = 16, 1.5× at n = 20 |
+| turbo vs fast, Lindblad noise (batched jumps, Newton jump location, single-launch kernel) | 2.3–3.5× at n = 8–12, 1.3× at n = 16, 1.07× at n = 20 |
+| turbo vs fast, shot-to-shot noise (one batch for samples with different H) | 12–14× at n = 8–12 |
+| `single=True` (complex64; means within ~5e-7 of complex128) | 1.37× (n = 10), 1.77× (n = 20), 1.92× (n = 22) |
+| two GPUs (`examples/emu_cheb/experiments/multi_gpu.py`) | 1.62× wall / 1.79× compute on an 80 s run (n = 18), plus ~4.5 s worker start-up |
+| tiled step kernel (`examples/emu_cheb/experiments/tiled_step.py`) | none: correct but slower in Triton |
+
+From n ≈ 18 the run time is memory traffic of the step kernel, which is why turbo's lead over fast fades; further
+gains need cheaper jump location or a hand-written CUDA tiled kernel.
 
 ## Experiments (`examples/emu_cheb/experiments/`)
 

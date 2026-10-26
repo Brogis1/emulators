@@ -48,7 +48,7 @@ def test_wrong_basis_string_state():
     assert str(ve.value) == msg
 
 
-@pytest.mark.parametrize("basis", (("0", "1"), ("g", "r"), ("g", "r", "x")))
+@pytest.mark.parametrize("basis", (("0", "1"), ("g", "r"), ("u", "d"), ("g", "r", "x")))
 def test_from_operator_string(basis):
     dim = len(basis)
     zero = basis[0]

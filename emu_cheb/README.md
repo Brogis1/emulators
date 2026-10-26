@@ -5,6 +5,29 @@
 [`emu_cheb.solvers`](solvers/README.md) (validated against emu-mps for every noise channel and FRESNEL's noise
 model; algorithms, validation and timings there); `ChebBackend` only translates. Status: experimental.
 
+Authors: Igor Sokolov & Mathieu Garrigues
+
+## Speed
+
+Exact, and much faster than emu-mps (measured; details and conditions in [solvers/README.md](solvers/README.md),
+"Performance"). Noisy, FRESNEL's noise model, time per trajectory, one A100 (emu-mps: one trajectory on the GPU):
+
+| n | emu-mps | emu_cheb (turbo) | speed-up |
+|---|---|---|---|
+| 8 (2 µs) | 34 s | 1.5 ms | ~23,000× |
+| 12 (2 µs) | 62 s | 4.0 ms | ~15,000× |
+| 16 (4 µs) | 172 s | 68 ms | ~2,500× |
+| 20 (4 µs) | 241 s | 1.25 s | ~190× |
+
+- **Noiseless quench** (A100): 0.10–1.4 s at n = 20–24 for 4 µs and 19 output times, where emu-mps takes 68–129 s
+  for half the duration (2 µs, 11 times) with errors 1e-5–1e-11: ~90–700× faster, and exact.
+- **CPU, small registers:** 0.4–0.5 ms per noisy trajectory at n = 3 against 0.7–2.7 s for emu-mps (validation
+  harness). Against emu-sv (CPU, `examples/emu_cheb/`): 16-atom quench 0.43 s against 4.3 s; for a few atoms with
+  Lindblad noise emu-sv's density matrix is cheaper than trajectories (6 atoms: 4 s against 8 s for 4000).
+- **Where it comes from:** one Chebyshev series for all output times, fused Triton kernels, trajectories and
+  shot-to-shot samples batched. turbo vs fast: 2.3–3.5× at n = 8–12 (Lindblad noise), 12–14× (shot-to-shot noise),
+  fading to 1.07× at n = 20, where memory traffic dominates; `single=True` adds 1.8–1.9× at n = 20–22.
+
 ## Install
 
 From a clone of this repository, like the other emulators (`dev_install.sh` installs every `ci/*` package):
