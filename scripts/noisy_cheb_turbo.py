@@ -75,8 +75,9 @@ def simulate(sequence, noise_model=None, n_trajectories: int = 1, eval_fractions
 def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed: int = 0,
                       device: str | torch.device = "cpu", single: bool = False, max_batch: int | None = None,
                       memory_bytes: float | None = None, initial_state: str | None = None, bounds: str = "lanczos",
-                      small_kernel: bool = True, vectorized: bool = True) -> ref.NoisyResults:
-    """One trajectory per SequenceData; samples with compatible structure are batched even if their H differ."""
+                      small_kernel: bool = True, vectorized: bool = True, on_state=None) -> ref.NoisyResults:
+    """One trajectory per SequenceData; samples with compatible structure are batched even if their H differ.
+    on_state: optional hook on the states at every output time, as noisy_cheb.run_sequence_data."""
     if bounds not in ("lanczos", "gershgorin"):
         raise ValueError('bounds must be "lanczos" or "gershgorin"')
     device = torch.device(device)
@@ -117,8 +118,10 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
         for c0 in range(0, len(idxs), r_max):
             chunk = idxs[c0:c0 + r_max]
             batch = _TurboBatchV if vectorized else _TurboBatch
-            part = batch([models[i] for i in chunk], [seeds[i] for i in chunk], times_ns, dtype, stats,
-                         initial_state, bounds, small_kernel).run()
+            b = batch([models[i] for i in chunk], [seeds[i] for i in chunk], times_ns, dtype, stats,
+                      initial_state, bounds, small_kernel)
+            b.on_state, b.ids = on_state, chunk
+            part = b.run()
             out["P"] += part["P"]
             out["corr"] += part["corr"]
             out["occ"][chunk] = part["occ"]

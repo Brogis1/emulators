@@ -99,6 +99,14 @@ Results: `res.probabilities` (mean $|\psi|^2$ over all atoms; bad and leaked ato
 `res.leaked` per trajectory, `res.correlations` (mean $\langle n_in_j\rangle$), `res.stats` (jumps, matvecs, accuracy
 indicators such as `jump_norm_dev` and `max_growth`).
 
+## Familiar API: `emu_cheb`
+
+The same engines behind the emu-sv / emu-mps interface: [`experimental/emu_cheb`](../experimental/emu_cheb/README.md)
+(`ChebBackend(seq, config=ChebConfig(observables=[...], noise_model=..., n_trajectories=...)).run()` returns a pulser
+`Results`; `optimization="auto" | "quench" | "turbo" | "fast" | "reference"` picks the script). Ported examples:
+`examples/emu_cheb/` (emu-sv's quench tutorials, `examples/emu_mps/heisenberg.ipynb`). The engines' only change
+for it is the opt-in `on_state` hook of `run_sequence_data` (default `None`: unchanged code path).
+
 ## Conventions
 
 * Units: frequencies in rad/µs, sequence times in ns (µs inside the solvers). Atom 0 = most significant bit.

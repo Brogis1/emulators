@@ -125,8 +125,16 @@ def simulate(sequence, noise_model=None, n_trajectories: int = 1, eval_fractions
 
 
 def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed: int = 0,
-                      device: str | torch.device = "cpu", initial_state: str | None = None) -> NoisyResults:
-    """One quantum trajectory per SequenceData of the iterable `sequences` (see the module docstring)."""
+                      device: str | torch.device = "cpu", initial_state: str | None = None,
+                      on_state=None) -> NoisyResults:
+    """One quantum trajectory per SequenceData of the iterable `sequences` (see the module docstring).
+
+    on_state: optional hook, called at every output index j with the states themselves (for observables that need
+        psi, e.g. experimental/emu_cheb): on_state(j, traj_ids, psi, active), traj_ids the indices into `sequences`
+        of the rows of psi (rows, 2^n_active) (unnormalised, read-only), active the mask of the atoms simulated.
+        It may be called again for the same (j, trajectory) (noisy_cheb_turbo reruns a batch when its Lanczos guard
+        trips): consumers assign, never accumulate. None (default): the code path is unchanged.
+    """
     device = torch.device(device)
     rng = np.random.default_rng(seed)
     stats = dict(trajectories=0, jumps=0, leaks=0, segments=0, matvecs=0, jump_norm_dev=0.0, max_growth=0.0)
@@ -141,7 +149,7 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
         model = cache[key]
         if times_ns is None:
             times_ns = model.output_times(eval_fractions)
-        P, leaked = model.trajectory(times_ns, rng, stats, initial_state)
+        P, leaked = model.trajectory(times_ns, rng, stats, initial_state, on_state, stats["trajectories"])
         n = model.n_total
         occ, second = ryd.moments(P, n)
         if mean is None:
@@ -229,8 +237,9 @@ class _Model:
         return int("".join(b for b, a in zip(initial_state, active) if a) or "0", 2)
 
     def trajectory(self, out_times: np.ndarray, rng: np.random.Generator, stats: dict,
-                   initial_state: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """(P (T, 2^n_total), leaked (T, n_total)) of one trajectory."""
+                   initial_state: str | None = None, on_state=None,
+                   traj_id: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """(P (T, 2^n_total), leaked (T, n_total)) of one trajectory; on_state / traj_id: see run_sequence_data."""
         active = self.good.copy()  # atoms still in the simulation (not bad, not leaked)
         leaked = np.zeros(self.n_total, bool)
         T = len(out_times)
@@ -248,6 +257,8 @@ class _Model:
                 p = psi.abs().square()
                 P[j, _embedding(active, self.device)] = p / p.sum()
                 leak_out[j] = torch.as_tensor(leaked)
+                if on_state is not None:  # opt-in hook: psi itself, while it is at out_times[j]
+                    on_state(j, [traj_id], psi[None], active.copy())
                 j += 1
 
         record()

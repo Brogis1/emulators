@@ -72,12 +72,13 @@ if triton is not None:
 def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequence[float],
            device: str | torch.device = "cuda", stats: dict | None = None,
            output: Literal["probabilities", "state"] = "probabilities",
-           bounds: Literal["gershgorin", "lanczos"] = "gershgorin", memory_bytes: float | None = None) -> torch.Tensor:
+           bounds: Literal["gershgorin", "lanczos"] = "gershgorin", memory_bytes: float | None = None,
+           on_state=None) -> torch.Tensor:
     """Probabilities |psi_r(t)|^2 (or amplitudes psi_r(t)) of R Heisenberg quenches from |0...0>, at increasing times.
 
     Args:
         J: (R, 3, n, n) couplings [Jxx, Jyy, Jzz] in rad/us, symmetric with zero diagonal (upper triangle read).
-        omega, delta, times_us, device, stats, output, bounds, memory_bytes: as in rydberg_cheb_fast.evolve.
+        omega, delta, times_us, device, stats, output, bounds, memory_bytes, on_state: as in rydberg_cheb_fast.evolve.
 
     Returns, Raises: as rydberg_cheb_fast.evolve.
     """
@@ -88,7 +89,7 @@ def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequen
     device = torch.device(device)
     if device.type == "cuda" and device.index is not None and device.index != torch.cuda.current_device():
         with torch.cuda.device(device):  # Triton launches on the current device, not on the tensors' device
-            return evolve(J, omega, delta, times, device, stats, output, bounds, memory_bytes)
+            return evolve(J, omega, delta, times, device, stats, output, bounds, memory_bytes, on_state)
     n_real, n = omega.shape
     dim, rows = 2 ** n, n_real * 2 ** n
     ham = _hamiltonian(J, omega, delta, device, bounds)
@@ -128,6 +129,8 @@ def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequen
             else:
                 torch.mul(psi[:, j], phases[j], out=target)
             del p
+            if on_state is not None:  # opt-in hook: psi(t_j) of every realization, only while it is in `acc`
+                on_state(j0 + j, (psi[:, j] * phases[j]).view(n_real, dim))
         del acc, z, psi
 
     if not max_norm2 <= 1 + GROWTH_TOL:
@@ -135,7 +138,7 @@ def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequen
             raise FloatingPointError(f"Chebyshev vectors grew (max ||T_k||^2 = {max_norm2:.3e}) with Gershgorin bounds")
         rejected = {"lanczos_rejected": max_norm2, "rejected_matvecs": ham.lanczos_matvecs + matvecs}
         del result, ham, step
-        out = evolve(J, omega, delta, times, device, stats, output, "gershgorin", memory_bytes)
+        out = evolve(J, omega, delta, times, device, stats, output, "gershgorin", memory_bytes, on_state)
         if stats is not None:
             stats.update(rejected)
         return out

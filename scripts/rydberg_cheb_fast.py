@@ -142,7 +142,8 @@ if triton is not None:
 def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequence[float],
            device: str | torch.device = "cuda", group_size: int = 6, stats: dict | None = None,
            output: Literal["probabilities", "state"] = "probabilities",
-           bounds: Literal["gershgorin", "lanczos"] = "gershgorin", memory_bytes: float | None = None) -> torch.Tensor:
+           bounds: Literal["gershgorin", "lanczos"] = "gershgorin", memory_bytes: float | None = None,
+           on_state=None) -> torch.Tensor:
     """Probabilities |psi_r(t)|^2 (or amplitudes psi_r(t)) of R quenches from |0...0>, at increasing times.
 
     Args:
@@ -162,6 +163,10 @@ def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequen
         memory_bytes: bytes the solver may use on `device` beyond the Hamiltonian diagonal (default on GPU:
             MEMORY_FRACTION of the free memory; on CPU: HOST_FRACTION of the free host / cgroup memory, no limit if
             unknown).
+        on_state: optional hook on_state(j, psi), called for every output index j with psi(t_j) (R, 2^n) complex128
+            (exact global phase, read-only) while the series still holds it, whatever `output`: observables that
+            need the amplitudes at a few times without returning them all (experimental/emu_cheb). After a rejected
+            Lanczos interval it is called again for the rerun's times. None (default): the code path is unchanged.
 
     Returns:
         Tensor (T, R, 2^n) on `device`, contiguous, basis index with atom 0 as the most significant bit: float64
@@ -189,7 +194,7 @@ def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequen
     device = torch.device(device)
     if device.type == "cuda" and device.index is not None and device.index != torch.cuda.current_device():
         with torch.cuda.device(device):  # Triton launches on the current device, not on the tensors' device
-            return evolve(J, omega, delta, times, device, group_size, stats, output, bounds, memory_bytes)
+            return evolve(J, omega, delta, times, device, group_size, stats, output, bounds, memory_bytes, on_state)
     n_real, n = omega.shape
     dim, rows = 2 ** n, n_real * 2 ** n
 
@@ -266,6 +271,8 @@ def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequen
             else:
                 torch.mul(psi[:, j], phases[j], out=target)
             del p
+            if on_state is not None:  # opt-in hook: psi(t_j) of every realization, only while it is in `acc`
+                on_state(j0 + j, (psi[:, j] * phases[j]).view(n_real, dim))
         del acc, z, psi
 
     if not max_norm2 <= 1 + GROWTH_TOL:
@@ -273,7 +280,7 @@ def evolve(J: np.ndarray, omega: np.ndarray, delta: np.ndarray, times_us: Sequen
             raise FloatingPointError(f"Chebyshev vectors grew (max ||T_k||^2 = {max_norm2:.3e}) with Gershgorin bounds")
         del result, diagonal, scaled_omega, step
         rejected = {"lanczos_rejected": max_norm2, "rejected_matvecs": lanczos_matvecs + matvecs}
-        out = evolve(J, omega, delta, times, device, group_size, stats, output, "gershgorin", memory_bytes)
+        out = evolve(J, omega, delta, times, device, group_size, stats, output, "gershgorin", memory_bytes, on_state)
         if stats is not None:
             stats.update(rejected)
         return out

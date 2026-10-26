@@ -64,7 +64,8 @@ def simulate(sequence, noise_model=None, n_trajectories: int = 1, eval_fractions
 
 def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed: int = 0,
                       device: str | torch.device = "cpu", single: bool = False, max_batch: int | None = None,
-                      memory_bytes: float | None = None, initial_state: str | None = None) -> ref.NoisyResults:
+                      memory_bytes: float | None = None, initial_state: str | None = None,
+                      on_state=None) -> ref.NoisyResults:
     """One trajectory per SequenceData, batched over consecutive identical samples.
 
     Args:
@@ -72,6 +73,7 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
         max_batch: cap on the rows of a batch (default: memory budget only).
         memory_bytes: memory the batch may use (default: 40 % of the free GPU memory; 2 GB on CPU).
         initial_state: as noisy_cheb.simulate.
+        on_state: optional hook on the states at every output time, as noisy_cheb.run_sequence_data.
     """
     device = torch.device(device)
     dtype = torch.complex64 if single else torch.complex128
@@ -101,7 +103,9 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
         while j < len(sds) and j - i < r_max and (id(sds[j].omega), id(sds[j].delta), id(sds[j].phi),
                                                      sds[j].bad_atoms) == key:
             j += 1
-        part = _Batch(model, times_ns, streams[i:j], dtype, stats, initial_state).run()
+        batch = _Batch(model, times_ns, streams[i:j], dtype, stats, initial_state)
+        batch.on_state, batch.ids = on_state, list(range(i, j))
+        part = batch.run()
         out = part if out is None else {k: (out[k] + part[k] if k in ("P", "corr") else torch.cat([out[k], part[k]]))
                                         for k in out}
         stats["trajectories"] += j - i
@@ -114,6 +118,9 @@ def run_sequence_data(sequences, eval_fractions: Sequence[float] = (1.0,), seed:
 
 class _Batch:
     """R trajectories of one _Model, advanced segment by segment (all rows reach every segment end together)."""
+
+    on_state = None  # optional hook on the states at the output times (noisy_cheb.run_sequence_data), set by the caller
+    ids = None  # index into the caller's samples of every row (for on_state)
 
     def __init__(self, model, out_times, rngs, dtype, stats, initial_state=None):
         self.model, self.out_times, self.rngs, self.dtype, self.stats = model, out_times, rngs, dtype, stats
@@ -251,6 +258,8 @@ class _Batch:
                 self.res["corr"][j] += second.sum(0)
                 self.res["occ"][rows, j] = occ.cpu()
                 self.res["leaked"][rows, j] = torch.as_tensor(self.leaked[rows])
+                if self.on_state is not None:  # opt-in hook: the states themselves, while they are at out_times[j]
+                    self.on_state(j, [self.ids[int(r)] for r in rows], psi, np.array(active))
             j += 1
         return j
 
